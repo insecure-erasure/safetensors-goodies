@@ -2,8 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project uses a simple `major.minor` versioning scheme.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+---
+
+## [1.1.4] - Flexible block protection and analysis output improvements
+
+### Added (`quantize-clip_g.py`)
+
+- **`--first-blocks-keep` / `-k` now accepts ranges and enumerations** in addition to a single integer. Valid formats: `7` (protect blocks 0–6, legacy), `0-6` (explicit range), `0-3,5-6` (multiple ranges), `0,1,4,5` (enumeration). The last block (31) is always protected regardless of the spec.
+- `parse_keep_spec()`: parses a `-k` spec string into a set of block indices. Raises `ValueError` with a descriptive message on invalid input.
+- `is_block_protected()`: replaces the previous `block_idx < first_keep or block_idx == last_block` inline checks throughout `convert()`.
+- When sensitive blocks in `--analyze` do not form a contiguous prefix, the recommendation now shows both the covering contiguous range and the exact `-k` enumeration for surgical protection.
+- `_analyze_attn_kv_fp8()` now includes the **Q projection** column in its per-block table and flags blocks where any of Q, K, or V exceeds 6% QError (previously only K and V were checked).
+
+### Changed (`quantize-clip_g.py`)
+
+- `convert()` signature: `first_keep: int` replaced by `protected_blocks: set`. All internal eligibility checks now use `is_block_protected()`.
+- `is_fp8_candidate()` signature: `first_keep: int` replaced by `protected_blocks: set`.
+- Block sensitivity ranking in `--analyze` is now displayed in **ascending block index order** instead of descending error order. Sensitive blocks are still flagged inline with `<< SENSITIVE`.
+- `--analyze` sections reordered: the split Q/K/V impact analysis is shown before the `out_proj` impact analysis.
+- `_analyze_attn_out_fp8()` and `_analyze_attn_kv_fp8()` section headers updated to `attn.out_proj quantization impact analysis` and `attn.in_proj split quantization impact analysis (--split-attn-qkv)`.
+- Startup summary now prints a human-readable description of protected blocks (e.g. `blocks 0-6 and block 31`, or `blocks 0,1,4,5 and block 31`) instead of the previous fixed `blocks 0-{first_keep-1} and block 31`.
+- FP8 candidate summary line changed from `blocks {first_keep}-{TOTAL_BLOCKS-2}` to `unprotected blocks`.
 
 ---
 

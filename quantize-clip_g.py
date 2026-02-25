@@ -36,6 +36,14 @@ Usage:
     # Default: MLP weights + fused in_proj_weight quantized to FP8
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors
 
+    # Protect specific blocks using ranges/enumerations
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0-6
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0-3,5-6
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0,1,4,5
+
+    # A single integer n means protect blocks 0..n-1 (legacy behavior)
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 7
+
     # Split attention: Q FP16, K/V FP8 (default split mode)
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv
 
@@ -109,6 +117,81 @@ IN_PROJ_BIAS   = "attn.in_proj_bias"
 
 
 # ---------------------------------------------------------------------------
+# Block-keep set parsing
+# ---------------------------------------------------------------------------
+
+def parse_keep_spec(spec: str) -> set:
+    """
+    Parse a block-keep specification into a set of block indices to protect.
+
+    Accepts:
+      - A single integer n  -> protect blocks 0..n-1  (legacy behavior)
+      - A comma-separated list of integers and/or ranges, e.g.:
+          0,1,2-4,6   ->  {0, 1, 2, 3, 4, 6}
+          0-6         ->  {0, 1, 2, 3, 4, 5, 6}
+          0-3,5-6     ->  {0, 1, 2, 3, 5, 6}
+          0,1,4,5     ->  {0, 1, 4, 5}
+
+    The last block (TOTAL_BLOCKS - 1) is always protected regardless of spec.
+    Raises ValueError with a descriptive message on invalid input.
+    """
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Block-keep specification is empty.")
+
+    # Detect legacy single-integer mode: no commas, no dashes (or leading dash for negative)
+    # A pure integer string means "protect 0..n-1"
+    if re.fullmatch(r'\d+', spec):
+        n = int(spec)
+        if n < 1 or n > TOTAL_BLOCKS - 1:
+            raise ValueError(
+                f"Single integer must be between 1 and {TOTAL_BLOCKS - 1} "
+                f"(got {n}). It means 'protect blocks 0..n-1'."
+            )
+        return set(range(n))
+
+    # General range/enumeration parsing
+    indices = set()
+    parts = spec.split(',')
+    for part in parts:
+        part = part.strip()
+        if not part:
+            raise ValueError(f"Empty segment in block-keep specification: '{spec}'")
+        range_match = re.fullmatch(r'(\d+)-(\d+)', part)
+        if range_match:
+            lo, hi = int(range_match.group(1)), int(range_match.group(2))
+            if lo > hi:
+                raise ValueError(
+                    f"Invalid range '{part}': start ({lo}) must be <= end ({hi})."
+                )
+            if hi >= TOTAL_BLOCKS:
+                raise ValueError(
+                    f"Block index {hi} in range '{part}' exceeds maximum "
+                    f"block index {TOTAL_BLOCKS - 1}."
+                )
+            indices.update(range(lo, hi + 1))
+        elif re.fullmatch(r'\d+', part):
+            idx = int(part)
+            if idx >= TOTAL_BLOCKS:
+                raise ValueError(
+                    f"Block index {idx} exceeds maximum block index {TOTAL_BLOCKS - 1}."
+                )
+            indices.add(idx)
+        else:
+            raise ValueError(
+                f"Cannot parse segment '{part}' in block-keep specification '{spec}'. "
+                f"Expected an integer or a range like '2-5'."
+            )
+    return indices
+
+
+def is_block_protected(block_idx: int, protected_blocks: set) -> bool:
+    """Return True if this block should be kept at FP16."""
+    last_block = TOTAL_BLOCKS - 1
+    return block_idx == last_block or block_idx in protected_blocks
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -167,15 +250,14 @@ def build_fp8_suffixes(split_mode: str, attn_out_fp8: bool) -> set:
     return suffixes
 
 
-def is_fp8_candidate(block_idx: int, suffix: str, first_keep: int, fp8_suffixes: set) -> bool:
+def is_fp8_candidate(block_idx: int, suffix: str, protected_blocks: set, fp8_suffixes: set) -> bool:
     """
     Return True if this (block_idx, suffix) pair should be quantized to FP8.
     Conditions:
-      - Block is in the intermediate range [first_keep, TOTAL_BLOCKS-1)
+      - Block is not in the protected set (which always includes the last block)
       - Suffix is in the FP8 candidate set
     """
-    last_block = TOTAL_BLOCKS - 1
-    if block_idx < first_keep or block_idx == last_block:
+    if is_block_protected(block_idx, protected_blocks):
         return False
     return suffix in fp8_suffixes
 
@@ -397,26 +479,27 @@ def analyze(input_path: Path):
         print()
 
     # --- Block ranking by quantization sensitivity ---
-    print("=" * 94)
-    print("Block sensitivity ranking (weighted average quantization error, higher = more sensitive)")
-    print("-" * 94)
-
-    ranked = sorted(block_agg_error.items(), key=lambda x: x[1], reverse=True)
-
     # Compute mean and standard deviation for threshold
-    errors = [e for _, e in ranked]
+    errors = list(block_agg_error.values())
     mean_error = sum(errors) / len(errors)
     std_error  = (sum((e - mean_error) ** 2 for e in errors) / len(errors)) ** 0.5
 
     # Blocks with error > mean + 1 std are flagged as sensitive
     threshold = mean_error + std_error
 
-    sensitive_blocks = []
-    for block_idx, err in ranked:
+    sensitive_blocks = sorted(
+        b for b, e in block_agg_error.items() if e > threshold
+    )
+
+    print("=" * 94)
+    print("Block sensitivity ranking (weighted average quantization error) — ordered by block index")
+    print("-" * 94)
+
+    # Display rows ordered by block index (ascending)
+    for block_idx in sorted(block_agg_error.keys()):
+        err  = block_agg_error[block_idx]
         flag = " << SENSITIVE" if err > threshold else ""
         print(f"  Block {block_idx:>2}: {err*100:.4f}%{flag}")
-        if err > threshold:
-            sensitive_blocks.append(block_idx)
 
     print()
     print(f"  Mean quantization error : {mean_error*100:.4f}%")
@@ -426,24 +509,31 @@ def analyze(input_path: Path):
 
     # --- General recommendation ---
     if sensitive_blocks:
-        sensitive_blocks.sort()
         block_list = ", ".join(str(b) for b in sensitive_blocks)
         print(f"  Recommendation: consider protecting blocks {block_list}")
         print(f"  These blocks show significantly higher quantization error than average.")
 
-        # Suggest --first-blocks-keep value if sensitive blocks form a prefix
-        contiguous_from_zero = 0
-        for i, b in enumerate(sensitive_blocks):
-            if b == i:
-                contiguous_from_zero = i + 1
+        # Recommend the minimum --first-blocks-keep that covers all sensitive blocks.
+        # If all sensitive blocks are below TOTAL_BLOCKS - 1 (last block is always protected),
+        # suggest a contiguous range 0..max_sensitive to keep the recommendation simple.
+        non_last_sensitive = [b for b in sensitive_blocks if b < TOTAL_BLOCKS - 1]
+        if non_last_sensitive:
+            suggested_keep = max(non_last_sensitive) + 1
+            # Check if the sensitive set forms a contiguous prefix from 0
+            is_prefix = all(b < suggested_keep for b in non_last_sensitive) and \
+                        len(non_last_sensitive) == suggested_keep
+            if is_prefix:
+                print(f"  Suggested --first-blocks-keep: {suggested_keep} "
+                      f"(covers sensitive blocks 0-{suggested_keep - 1})")
             else:
-                break
+                # Sensitive blocks are not a contiguous prefix: recommend the covering
+                # contiguous range and also show the exact set for -k enumeration.
+                print(f"  Suggested --first-blocks-keep: {suggested_keep} "
+                      f"(contiguous range 0-{suggested_keep - 1} covering all sensitive blocks)")
+                exact_spec = ",".join(str(b) for b in non_last_sensitive)
+                print(f"  Alternatively, protect only sensitive blocks with: -k {exact_spec}")
 
-        if contiguous_from_zero > 0:
-            print(f"  Suggested --first-blocks-keep: {contiguous_from_zero} "
-                  f"(covers initial sensitive blocks 0-{contiguous_from_zero-1})")
-
-        # Check for sensitive blocks near the end
+        # Note about sensitive blocks near the end
         last_block = TOTAL_BLOCKS - 1
         sensitive_tail = [b for b in sensitive_blocks if b >= last_block - 3 and b != last_block]
         if sensitive_tail:
@@ -456,11 +546,11 @@ def analyze(input_path: Path):
 
     print()
 
-    # --- --attn-out-fp8 impact analysis ---
-    _analyze_attn_out_fp8(block_raw, sensitive_blocks)
-
-    # --- --split-attn-qkv + K/V impact analysis ---
+    # --- --split-attn-qkv K/V quantization impact analysis (shown first) ---
     _analyze_attn_kv_fp8(block_raw, sensitive_blocks)
+
+    # --- --attn-out-fp8 impact analysis (shown second) ---
+    _analyze_attn_out_fp8(block_raw, sensitive_blocks)
 
     print()
 
@@ -487,7 +577,7 @@ def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
     elevated = {b: e for b, e in out_proj_errors.items() if e >= WARN_THRESHOLD_OUT_PROJ}
     high     = {b: e for b, e in out_proj_errors.items() if e >= WARN_THRESHOLD_HIGH}
 
-    print("  --attn-out-fp8 impact analysis")
+    print("  attn.out_proj quantization impact analysis")
     print("  " + "-" * 60)
 
     if not elevated:
@@ -536,73 +626,73 @@ def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
 
     # Cross-reference with general --first-blocks-keep recommendation
     if sensitive_blocks:
-        suggested_keep = max(sensitive_blocks) + 1 if sensitive_blocks[-1] < TOTAL_BLOCKS - 1 else TOTAL_BLOCKS - 2
-        contiguous_keep = 0
-        for i, b in enumerate(sensitive_blocks):
-            if b == i:
-                contiguous_keep = i + 1
-            else:
-                break
-
-        effective_keep = contiguous_keep if contiguous_keep > 0 else suggested_keep
-        remaining_elev = [b for b in elev_blocks if b >= effective_keep]
-        if remaining_elev:
-            print(f"  With the suggested --first-blocks-keep {effective_keep}, blocks "
-                  f"{', '.join(str(b) for b in remaining_elev)} would still be exposed "
-                  f"to out_proj quantization.")
-            print(f"  Consider omitting --attn-out-fp8 or raising --first-blocks-keep "
-                  f"to {max(remaining_elev) + 1}.")
+        non_last_sensitive = [b for b in sensitive_blocks if b < TOTAL_BLOCKS - 1]
+        if non_last_sensitive:
+            effective_keep = max(non_last_sensitive) + 1
+            remaining_elev = [b for b in elev_blocks if b >= effective_keep]
+            if remaining_elev:
+                print(f"  With the suggested --first-blocks-keep {effective_keep}, blocks "
+                      f"{', '.join(str(b) for b in remaining_elev)} would still be exposed "
+                      f"to out_proj quantization.")
+                print(f"  Consider omitting --attn-out-fp8 or raising --first-blocks-keep "
+                      f"to {max(remaining_elev) + 1}.")
 
     print()
 
 
 def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
     """
-    Report the per-block impact of enabling --split-attn-qkv with K/V quantization,
-    highlighting blocks where K or V projection quantization error is elevated.
+    Report the per-block impact of enabling --split-attn-qkv with Q/K/V quantization,
+    highlighting blocks where Q, K or V projection quantization error is elevated.
     """
     last_block = TOTAL_BLOCKS - 1
 
     WARN_KV = 0.06  # 6%: K/V are somewhat more sensitive than MLP
 
-    kv_errors = {}
+    qkv_errors = {}
     for block_idx in sorted(block_raw.keys()):
         if block_idx == last_block:
             continue
         suffix_data = block_raw[block_idx]
+        q_err = suffix_data.get("attn.q_proj.weight", {}).get("quant_error")
         k_err = suffix_data.get("attn.k_proj.weight", {}).get("quant_error")
         v_err = suffix_data.get("attn.v_proj.weight", {}).get("quant_error")
-        if k_err is not None and v_err is not None:
-            kv_errors[block_idx] = {"k": k_err, "v": v_err, "max": max(k_err, v_err)}
+        if q_err is not None and k_err is not None and v_err is not None:
+            qkv_errors[block_idx] = {
+                "q": q_err,
+                "k": k_err,
+                "v": v_err,
+                "max": max(q_err, k_err, v_err),
+            }
 
-    if not kv_errors:
+    if not qkv_errors:
         return
 
-    elevated_kv = {b: d for b, d in kv_errors.items() if d["max"] >= WARN_KV}
+    elevated_qkv = {b: d for b, d in qkv_errors.items() if d["max"] >= WARN_KV}
 
-    print("  --split-attn-qkv K/V quantization impact analysis")
+    print("  attn.in_proj split quantization impact analysis (--split-attn-qkv)")
     print("  " + "-" * 60)
 
-    if not elevated_kv:
-        print("  All intermediate blocks show acceptable K/V QError (<6%).")
-        print("  --split-attn-qkv with K/V FP8 is safe across intermediate blocks.")
+    if not elevated_qkv:
+        print("  All intermediate blocks show acceptable Q/K/V QError (<6%).")
+        print("  --split-attn-qkv with Q/K/V FP8 is safe across intermediate blocks.")
         print()
         return
 
-    print(f"  {'Block':>5}  {'K QError%':>10}  {'V QError%':>10}  {'Risk':>10}")
-    print(f"  {'-'*5}  {'-'*10}  {'-'*10}  {'-'*10}")
-    for block_idx in sorted(kv_errors.keys()):
-        d = kv_errors[block_idx]
+    print(f"  {'Block':>5}  {'Q QError%':>10}  {'K QError%':>10}  {'V QError%':>10}  {'Risk':>10}")
+    print(f"  {'-'*5}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+    for block_idx in sorted(qkv_errors.keys()):
+        d = qkv_errors[block_idx]
         risk = "ELEVATED" if d["max"] >= WARN_KV else "ok"
         marker = " <<" if d["max"] >= WARN_KV else ""
-        print(f"  {block_idx:>5}  {d['k']*100:>9.4f}%  {d['v']*100:>9.4f}%  {risk:>10}{marker}")
+        print(f"  {block_idx:>5}  {d['q']*100:>9.4f}%  {d['k']*100:>9.4f}%  {d['v']*100:>9.4f}%  {risk:>10}{marker}")
 
     print()
-    elev_blocks    = sorted(elevated_kv.keys())
-    min_keep_kv    = max(elev_blocks) + 1
-    print(f"  CAUTION: {len(elev_blocks)} block(s) with elevated K/V QError (≥6%): "
+    elev_blocks = sorted(elevated_qkv.keys())
+    min_keep_kv = max(elev_blocks) + 1
+    print(f"  CAUTION: {len(elev_blocks)} block(s) with elevated Q/K/V QError (≥6%): "
           f"{', '.join(str(b) for b in elev_blocks)}")
-    print(f"           To safely use K/V FP8, set --first-blocks-keep >= {min_keep_kv},")
+    print(f"           To safely use Q/K/V FP8, set --first-blocks-keep >= {min_keep_kv},")
     print(f"           or use --split-attn-qkv q16,kv16 to keep Q/K/V at FP16 after the split.")
     print()
 
@@ -611,7 +701,7 @@ def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
+def convert(input_path: Path, output_path: Path, protected_blocks: set, dry_run: bool,
             split_mode: str, attn_out_fp8: bool, verbose: bool):
     if not check_fp8_support():
         print("ERROR: float8_e4m3fn is not available in this PyTorch build.")
@@ -624,16 +714,29 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
 
     fp8_suffixes = build_fp8_suffixes(split_mode, attn_out_fp8)
 
+    last_block = TOTAL_BLOCKS - 1
+
+    # Build a human-readable description of protected blocks for the summary
+    protected_non_last = sorted(b for b in protected_blocks if b != last_block)
+    if protected_non_last:
+        # Check if it's a contiguous prefix
+        if protected_non_last == list(range(len(protected_non_last))):
+            protected_desc = f"blocks 0-{protected_non_last[-1]} and block {last_block}"
+        else:
+            protected_desc = f"blocks {','.join(str(b) for b in protected_non_last)} and block {last_block}"
+    else:
+        protected_desc = f"block {last_block} only"
+
     print(f"Loading: {input_path}")
     sd_in = load_file(str(input_path))
     print(f"  Tensors loaded : {len(sd_in)}")
-    print(f"  FP16 preserved : blocks 0-{first_keep-1} and block {TOTAL_BLOCKS-1}")
+    print(f"  FP16 preserved : {protected_desc}")
 
     if not split_attn:
         fp8_desc = "MLP weights + attn.in_proj_weight (fused)"
         if attn_out_fp8:
             fp8_desc += " + attn out_proj"
-        print(f"  FP8 candidates : blocks {first_keep}-{TOTAL_BLOCKS-2} ({fp8_desc})")
+        print(f"  FP8 candidates : unprotected blocks ({fp8_desc})")
         print(f"  in_proj_weight : fused FP8 (default)")
     else:
         fp8_desc = "MLP weights"
@@ -645,7 +748,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
             fp8_desc += " + attn Q"
         if attn_out_fp8:
             fp8_desc += " + attn out_proj"
-        print(f"  FP8 candidates : blocks {first_keep}-{TOTAL_BLOCKS-2} ({fp8_desc})")
+        print(f"  FP8 candidates : unprotected blocks ({fp8_desc})")
         print(f"  Split attn     : enabled (in_proj_weight -> Q/K/V, mode: {split_mode})")
     print()
 
@@ -676,9 +779,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
         # ----------------------------------------------------------------
         if suffix == IN_PROJ_WEIGHT:
             if not split_attn:
-                last_block = TOTAL_BLOCKS - 1
-                eligible = (block_idx >= first_keep) and (block_idx != last_block)
-                if eligible:
+                if not is_block_protected(block_idx, protected_blocks):
                     # Default: quantize fused tensor directly to FP8
                     check_outliers(tensor, key, verbose)
                     sd_out[key] = to_fp8(tensor)
@@ -693,12 +794,10 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
 
             # --split-attn-qkv: split Q/K/V and apply per-component strategy
             q, k, v = split_in_proj(tensor)
-            last_block = TOTAL_BLOCKS - 1
-            eligible = (block_idx >= first_keep) and (block_idx != last_block)
 
             base = f"transformer.resblocks.{block_idx}"
 
-            if eligible:
+            if not is_block_protected(block_idx, protected_blocks):
                 # Q: FP8 only if split mode starts with q8, otherwise FP16
                 q_key = f"{base}.attn.q_proj.weight"
                 if attn_q_fp8:
@@ -748,10 +847,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
                 continue
 
             # --split-attn-qkv: split bias consistently with weights
-            last_block = TOTAL_BLOCKS - 1
-            eligible = (block_idx >= first_keep) and (block_idx != last_block)
-
-            if eligible:
+            if not is_block_protected(block_idx, protected_blocks):
                 q_bias, k_bias, v_bias = split_in_proj(tensor)
                 base = f"transformer.resblocks.{block_idx}"
                 q_bias_key = f"{base}.attn.q_proj.bias"
@@ -775,7 +871,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
         # ----------------------------------------------------------------
         # Regular resblock tensor
         # ----------------------------------------------------------------
-        if is_fp8_candidate(block_idx, suffix, first_keep, fp8_suffixes):
+        if is_fp8_candidate(block_idx, suffix, protected_blocks, fp8_suffixes):
             check_outliers(tensor, key, verbose)
             sd_out[key] = to_fp8(tensor)
             log_tensor(key, tensor.dtype, torch.float8_e4m3fn, verbose)
@@ -869,10 +965,15 @@ def main():
              "(not required when using --analyze)"
     )
     parser.add_argument(
-        "--first-blocks-keep", "-k", type=int, default=DEFAULT_KEEP,
-        metavar="N",
-        help=f"Number of initial blocks to keep at FP16 (default: {DEFAULT_KEEP}). "
-             f"Block {TOTAL_BLOCKS-1} is always kept at FP16."
+        "--first-blocks-keep", "-k", type=str, default=str(DEFAULT_KEEP),
+        metavar="SPEC",
+        help=(
+            f"Blocks to keep at FP16. Accepts a single integer n (protect blocks 0..n-1), "
+            f"or a comma-separated list of indices and/or ranges, e.g.: "
+            f"7  |  0-6  |  0-3,5-6  |  0,1,4,5  |  0,1,2-4,6. "
+            f"Block {TOTAL_BLOCKS-1} is always kept at FP16 regardless of this setting. "
+            f"(default: {DEFAULT_KEEP}, i.e. blocks 0-{DEFAULT_KEEP-1})"
+        )
     )
     parser.add_argument(
         "--analyze", action="store_true",
@@ -931,34 +1032,33 @@ def main():
 
     output_path = Path(args.output)
 
-    if args.first_blocks_keep < 1 or args.first_blocks_keep >= TOTAL_BLOCKS - 1:
-        print(
-            f"ERROR: --first-blocks-keep must be between 1 and {TOTAL_BLOCKS - 2}",
-            file=sys.stderr
-        )
+    # Parse block-keep specification
+    try:
+        protected_blocks = parse_keep_spec(args.first_blocks_keep)
+    except ValueError as e:
+        print(f"ERROR: Invalid --first-blocks-keep value: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Always protect the last block
+    protected_blocks.add(TOTAL_BLOCKS - 1)
 
     # Inform the user about the split mode when using the default
     split_mode = args.split_attn_qkv
     if split_mode is not None:
-        # Check if the user passed --split-attn-qkv without an explicit value
-        # by comparing with the const default
-        if split_mode == DEFAULT_SPLIT_MODE and f"--split-attn-qkv" in sys.argv:
-            # Determine if a value was explicitly given or if const was used
-            idx = None
-            for i, arg in enumerate(sys.argv):
-                if arg == "--split-attn-qkv":
-                    idx = i
-                    break
-            explicit = (idx is not None
-                        and idx + 1 < len(sys.argv)
-                        and sys.argv[idx + 1] in SPLIT_MODES)
-            if not explicit:
-                print(f"NOTE: --split-attn-qkv used without explicit mode. "
-                      f"Defaulting to {DEFAULT_SPLIT_MODE} (Q FP16, K/V FP8).")
-                print()
+        idx = None
+        for i, arg in enumerate(sys.argv):
+            if arg == "--split-attn-qkv":
+                idx = i
+                break
+        explicit = (idx is not None
+                    and idx + 1 < len(sys.argv)
+                    and sys.argv[idx + 1] in SPLIT_MODES)
+        if not explicit and split_mode == DEFAULT_SPLIT_MODE:
+            print(f"NOTE: --split-attn-qkv used without explicit mode. "
+                  f"Defaulting to {DEFAULT_SPLIT_MODE} (Q FP16, K/V FP8).")
+            print()
 
-    convert(input_path, output_path, args.first_blocks_keep, args.dry_run,
+    convert(input_path, output_path, protected_blocks, args.dry_run,
             split_mode, args.attn_out_fp8, args.verbose)
 
 

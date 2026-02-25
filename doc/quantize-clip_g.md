@@ -97,6 +97,24 @@ python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
     --split-attn-qkv q8,kv8 --attn-out-fp8
 ```
 
+### Protect specific blocks using ranges or enumerations
+
+```bash
+# Single integer n: protect blocks 0..n-1 (legacy behaviour, default is 7)
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 7
+
+# Contiguous range
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0-6
+
+# Non-contiguous ranges
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0-3,5-6
+
+# Explicit enumeration
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors -k 0,1,4,5
+```
+
+Block 31 is always protected regardless of the `-k` value.
+
 ### Analyze before quantizing
 
 ```bash
@@ -127,7 +145,7 @@ python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
 |---|---|---|---|
 | `--input` | `-i` | *(required)* | Input safetensors file (CLIP-G, OpenCLIP format, FP16) |
 | `--output` | `-o` | *(required unless `--analyze`)* | Output safetensors file |
-| `--first-blocks-keep` | `-k` | `7` | Number of initial blocks to preserve at FP16 (blocks 0 to N−1). Block 31 is always preserved. |
+| `--first-blocks-keep` | `-k` | `7` | Blocks to preserve at FP16. Accepts a single integer `n` (protects blocks 0 to n−1), or a comma-separated list of indices and/or ranges (e.g. `0-3,5-6`, `0,1,4,5`). Block 31 is always preserved regardless of this setting. |
 | `--analyze` | | off | Analyze quantization sensitivity per block. Prints metrics and recommendations. Does not write any file. |
 | `--split-attn-qkv [MODE]` | | off | Split fused `in_proj_weight` into separate Q/K/V tensors. Optional mode controls per-component precision (see table below). When omitted, `in_proj_weight` is quantized to FP8 as a fused tensor. |
 | `--attn-out-fp8` | | off | Quantize `out_proj.weight` to FP8 in intermediate blocks. Does not require `--split-attn-qkv`. |
@@ -160,13 +178,19 @@ When `--split-attn-qkv` is used without an explicit mode, the script prints a no
 | `Outliers` | Values outside the FP8 E4M3 representable range (±448) |
 | `QError%` | Roundtrip quantization error — NRMSE from FP16 → FP8 → FP16 |
 
-Blocks are ranked by their **weighted average quantization error** (across all quantizable tensors). Blocks with error above mean + 1 standard deviation are flagged as sensitive, and the script emits a recommendation for `--first-blocks-keep`.
+Blocks are ranked by their **weighted average quantization error** (across all quantizable tensors), displayed in **block index order** with sensitive blocks flagged inline. Blocks with error above mean + 1 standard deviation are flagged as sensitive.
+
+The recommendation section suggests a `--first-blocks-keep` value covering all sensitive blocks. When sensitive blocks do not form a contiguous prefix, both the covering contiguous range and the exact `-k` enumeration are shown.
 
 The fused `in_proj_weight` is analyzed both as a whole and split into Q, K, V components. The Q/K/V rows are rendered indented under `attn.in_proj_weight` using a tree-style layout (`├─` / `└─`).
 
 After the general block ranking, the analysis mode emits two additional sections:
 
-### --attn-out-fp8 impact analysis
+### attn.in_proj split quantization impact analysis
+
+Reports per-block quantization error for `attn.q_proj.weight`, `attn.k_proj.weight`, and `attn.v_proj.weight` (derived from splitting `in_proj_weight`) across all intermediate blocks. Blocks where any of Q, K, or V exceeds 6% QError are flagged as elevated. The section recommends the minimum `--first-blocks-keep` to cover them, or suggests using `--split-attn-qkv q16,kv16` as an alternative.
+
+### attn.out_proj quantization impact analysis
 
 Reports per-block quantization error for `attn.out_proj.weight` across all intermediate blocks, with risk classification:
 
@@ -177,10 +201,6 @@ Reports per-block quantization error for `attn.out_proj.weight` across all inter
 | QError ≥ 12% | HIGH | Strongly discouraged |
 
 For blocks with elevated or high risk, the section reports the minimum `--first-blocks-keep` value needed to exclude them from quantization, and cross-references it with the general block sensitivity recommendation.
-
-### --split-attn-qkv K/V quantization impact analysis
-
-Reports per-block quantization error for `attn.k_proj.weight` and `attn.v_proj.weight` (derived from splitting `in_proj_weight`) across all intermediate blocks. Blocks where either K or V exceeds 6% QError are flagged as elevated. The section recommends the minimum `--first-blocks-keep` to cover them, or suggests using `--keep-attn-kv-fp16` as an alternative.
 
 ---
 
