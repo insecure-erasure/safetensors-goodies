@@ -7,6 +7,13 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.3] - Flux key transform fixes for nested transformer prefix
+
+### Fixed
+
+- Flux `clip_l` and `t5xxl` key transforms now also strip the intermediate `.transformer.` level present in some Flux checkpoint variants. Added transform entries for `text_encoders.clip_l.transformer.*`, `text_encoder.clip_l.transformer.*`, `clip_l.transformer.*`, and the equivalent patterns for `t5xxl`. Previously, keys from these checkpoints would pass through untransformed and fail to load as standalone models in ComfyUI.
+
+
 ## [2.2] - Float8 support and Flux text encoder fixes
 
 ### Added

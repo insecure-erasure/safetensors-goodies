@@ -308,8 +308,11 @@ ARCHITECTURE_PATTERNS = {
                     r'^clip\.',
                 ],
                 'key_transforms': [
+                    ('text_encoders.clip_l.transformer.', ''),
+                    ('text_encoder.clip_l.transformer.', ''),
                     ('text_encoders.clip_l.', ''),
                     ('text_encoder.clip_l.', ''),
+                    ('clip_l.transformer.', ''),
                     ('clip_l.', ''),
                 ],
             },
@@ -322,8 +325,11 @@ ARCHITECTURE_PATTERNS = {
                     r'^text_encoder_2\.',
                 ],
                 'key_transforms': [
+                    ('text_encoders.t5xxl.transformer.', ''),
+                    ('text_encoder.t5xxl.transformer.', ''),
                     ('text_encoders.t5xxl.', ''),
                     ('text_encoder.t5xxl.', ''),
+                    ('t5xxl.transformer.', ''),
                     ('t5xxl.', ''),
                     ('text_encoder_2.', ''),
                 ],
