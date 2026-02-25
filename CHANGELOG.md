@@ -7,6 +7,32 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.1] - Adaptive 16-bit conversion and post-conversion validation
+
+### Added
+
+- **Adaptive 16-bit conversion**: when downscaling from fp32, the script now inspects the actual tensor values before choosing a target dtype. If all values fit within the fp16 range (±65504), fp16 is used; otherwise the component falls back to bf16. The decision is made per-component by default, or per-tensor with `--mixed-dtype`.
+- `tensor_fits_fp16()`: checks whether a tensor's values fall within fp16 range.
+- `analyze_component_for_fp16()`: scans all tensors in a component and returns a list of those that exceed fp16 range, with their max absolute value.
+- **Post-conversion validation** via `validate_conversion()`: runs automatically after every conversion and checks for three issues — new infinity values (overflow), values flushed to zero (underflow), and new NaNs. Reports via `UserWarning` if thresholds are exceeded.
+- `-m` / `--mixed-dtype` flag: enables per-tensor fp16/bf16 decision instead of the default per-component decision. Emits a compatibility warning when the output file ends up with mixed dtypes.
+
+### Changed
+
+- `--*-precision` flags now accept integers (`16` or `32`) instead of strings (`fp16`, `bf16`, `fp8`). The script determines the specific 16-bit dtype (fp16 or bf16) automatically based on value range analysis.
+- Default precision policy message updated to reflect adaptive behavior: `fp32 → 16-bit adaptive (fp16 if fits, else bf16)`.
+- `apply_precision_policy()` rewritten around the new `convert_tensor_to_16bit()` helper, which encapsulates the fp16/bf16 selection logic.
+- `PRECISION_MAP` removed; dtype selection is now handled directly via `convert_tensor_to_16bit()` and the `DTYPE_BITS` lookup.
+
+### Removed
+
+- `fp8`, `bf16`, and `fp32`/`fp16` as explicit string choices for `--*-precision` flags — replaced by integer `16`/`32`.
+- `fp8` as a conversion target for explicit precision overrides.
+- `convert_tensor_precision()` — replaced by `convert_tensor_to_16bit()` and inline upscale guard in `apply_precision_policy()`.
+- `DEFAULT_DOWNSCALE_PRECISION` and `LOW_PRECISION_BITS` constants.
+- `fp8`/`fp5m2` entries from `DTYPE_BITS` (only standard float and int dtypes remain).
+
+
 ## [2.0] - Universal extractor with architecture auto-detection
 
 Complete rewrite. The script is no longer SDXL/Pony-specific; it now detects the model architecture automatically and adapts its classification and key transformation logic accordingly.

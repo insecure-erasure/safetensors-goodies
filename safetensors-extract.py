@@ -8,7 +8,7 @@ Key features:
 - Auto-detection of model architecture
 - Dynamic component classification
 - Key transformation for standalone ComfyUI-compatible loading
-- Precision conversion with validation
+- Adaptive precision conversion (fp16/bf16) with validation
 - Fallback extraction for unknown architectures
 """
 
@@ -27,20 +27,14 @@ import torch
 # PRECISION HANDLING
 # =============================================================================
 
-PRECISION_MAP = {
-    'fp32': (torch.float32, 32),
-    'fp16': (torch.float16, 16),
-    'bf16': (torch.bfloat16, 16),
-    'fp8': (torch.float8_e4m3fn, 8),
-}
+# FP16 max representable value
+FP16_MAX = 65504.0
 
 DTYPE_BITS = {
     torch.float32: 32,
     torch.float16: 16,
     torch.bfloat16: 16,
     torch.float64: 64,
-    torch.float8_e4m3fn: 8,
-    torch.float8_e5m2: 8,
     torch.int8: 8,
     torch.uint8: 8,
     torch.int16: 16,
@@ -52,6 +46,113 @@ DTYPE_BITS = {
 def get_tensor_bits(dtype):
     """Returns the bit size of a tensor's dtype."""
     return DTYPE_BITS.get(dtype, 32)
+
+
+def tensor_fits_fp16(tensor):
+    """
+    Check if all values in a tensor fit within fp16 range (±65504).
+    Returns (fits, max_abs_value)
+    """
+    if tensor.dtype in (torch.float32, torch.float64):
+        max_abs = tensor.abs().max().item()
+        return max_abs <= FP16_MAX, max_abs
+    # Already fp16 or lower precision
+    return True, 0.0
+
+
+def validate_conversion(original, converted, key, component_name):
+    """
+    Validates precision conversion detecting potential issues.
+    Always runs after conversion. Reports warnings but doesn't block.
+
+    Returns list of warning messages.
+    """
+    warnings_list = []
+
+    # 1. Check for new infinities (overflow)
+    orig_inf_count = torch.isinf(original).sum().item()
+    conv_inf_count = torch.isinf(converted).sum().item()
+    if conv_inf_count > orig_inf_count:
+        new_infs = conv_inf_count - orig_inf_count
+        warnings_list.append(
+            f"[{component_name}] '{key}': {new_infs} new inf values (overflow)"
+        )
+
+    # 2. Check for flush-to-zero (non-zero becoming zero)
+    orig_nonzero_mask = original != 0
+    orig_nonzero_count = orig_nonzero_mask.sum().item()
+    if orig_nonzero_count > 0:
+        # Compare in same dtype to avoid precision issues in comparison
+        conv_zero_from_nonzero = (orig_nonzero_mask & (converted == 0)).sum().item()
+        if conv_zero_from_nonzero > 0:
+            pct = 100 * conv_zero_from_nonzero / orig_nonzero_count
+            if pct > 0.001:  # Report if more than 0.001%
+                warnings_list.append(
+                    f"[{component_name}] '{key}': {conv_zero_from_nonzero} values "
+                    f"flushed to zero ({pct:.4f}%)"
+                )
+
+    # 3. Check for new NaNs
+    orig_nan = torch.isnan(original).sum().item()
+    conv_nan = torch.isnan(converted).sum().item()
+    if conv_nan > orig_nan:
+        warnings_list.append(
+            f"[{component_name}] '{key}': {conv_nan - orig_nan} new NaN values"
+        )
+
+    return warnings_list
+
+
+def convert_tensor_to_16bit(tensor, force_bf16=False):
+    """
+    Convert a tensor to 16-bit precision.
+
+    Args:
+        tensor: Input tensor
+        force_bf16: If True, always use bf16. If False, use fp16 if values fit.
+
+    Returns:
+        Converted tensor (fp16 or bf16)
+    """
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        # Already 16-bit
+        return tensor
+
+    if tensor.dtype not in (torch.float32, torch.float64):
+        # Not a float type we convert (e.g., int tensors)
+        return tensor
+
+    if force_bf16:
+        return tensor.to(torch.bfloat16)
+
+    # Check if fp16 is safe
+    fits, _ = tensor_fits_fp16(tensor)
+    if fits:
+        return tensor.to(torch.float16)
+    else:
+        return tensor.to(torch.bfloat16)
+
+
+def analyze_component_for_fp16(tensors):
+    """
+    Analyze all tensors in a component to determine if fp16 is safe for all.
+
+    Args:
+        tensors: Dict of {key: tensor}
+
+    Returns:
+        (all_fit_fp16, problematic_keys)
+        - all_fit_fp16: True if all tensors fit in fp16 range
+        - problematic_keys: List of (key, max_abs_value) for tensors that don't fit
+    """
+    problematic = []
+    for key, tensor in tensors.items():
+        if tensor.dtype in (torch.float32, torch.float64):
+            fits, max_abs = tensor_fits_fp16(tensor)
+            if not fits:
+                problematic.append((key, max_abs))
+
+    return len(problematic) == 0, problematic
 
 
 # =============================================================================
@@ -468,70 +569,31 @@ def transform_key(key, component, architecture):
 # PRECISION CONVERSION
 # =============================================================================
 
-# Precisions that are considered "low" and should be preserved by default
-LOW_PRECISION_BITS = {8, 16}
-
-# Default downscale target when fp32 is found and --keep-precision is not set
-DEFAULT_DOWNSCALE_PRECISION = 'fp16'
-
-
-def convert_tensor_precision(tensor, target_precision, component_name, key, explicit_request=False):
-    """
-    Converts a tensor to target precision with validation.
-
-    Args:
-        tensor: Input tensor
-        target_precision: Target precision string ('fp32', 'fp16', 'bf16', 'fp8')
-        component_name: Component name for warnings
-        key: Tensor key for warnings
-        explicit_request: If True, this was explicitly requested by user
-
-    Returns:
-        Converted tensor or original if conversion is invalid
-    """
-    if target_precision not in PRECISION_MAP:
-        return tensor
-
-    target_dtype, target_bits = PRECISION_MAP[target_precision]
-    source_bits = get_tensor_bits(tensor.dtype)
-
-    # Don't upscale - warn if explicitly requested
-    if target_bits > source_bits:
-        if explicit_request:
-            warnings.warn(
-                f"[{component_name}] '{key}' is {source_bits}-bit. "
-                f"Cannot upscale to {target_bits}-bit ({target_precision}). Keeping original.",
-                UserWarning
-            )
-        return tensor
-
-    # Same precision, no conversion needed
-    if tensor.dtype == target_dtype:
-        return tensor
-
-    # Convert
-    return tensor.to(target_dtype)
-
-
 def apply_precision_policy(
     tensors,
     component_name,
     explicit_precision=None,
-    keep_precision=False
+    keep_precision=False,
+    mixed_dtype=False
 ):
     """
     Apply precision policy to a dict of tensors.
 
     Policy:
-    1. If explicit_precision is set: use it (unless it's an upscale)
+    1. If explicit_precision is set (16 or 32): apply it
     2. If keep_precision is True: keep original
-    3. Default: downscale fp32 to fp16, keep fp8/fp16 as-is
+    3. Default: downscale fp32 to 16-bit (except VAE)
+
+    For 16-bit conversion:
+    - By default, analyze all tensors and pick fp16 or bf16 for the whole component
+    - If mixed_dtype is True, decide per-tensor (may produce mixed fp16/bf16)
 
     Args:
         tensors: Dict of {key: tensor}
         component_name: Component name for logging
-        explicit_precision: User-requested precision (or None)
+        explicit_precision: User-requested precision (16 or 32) or None
         keep_precision: If True, preserve original precision
+        mixed_dtype: If True, allow mixed fp16/bf16 per tensor
 
     Returns:
         (converted_tensors, precision_suffix)
@@ -540,31 +602,83 @@ def apply_precision_policy(
     converted = {}
     conversion_stats = defaultdict(int)
     precision_suffix = None
+    all_warnings = []
+
+    # Determine if we need to do 16-bit conversion
+    needs_16bit_conversion = False
+    if explicit_precision == 16:
+        needs_16bit_conversion = True
+    elif not keep_precision and not explicit_precision:
+        # Default policy: downscale fp32 to 16-bit, except VAE
+        if component_name != 'vae':
+            # Check if any tensor is fp32
+            for tensor in tensors.values():
+                if get_tensor_bits(tensor.dtype) > 16:
+                    needs_16bit_conversion = True
+                    break
+
+    if needs_16bit_conversion and not mixed_dtype:
+        # Analyze component to decide fp16 vs bf16
+        all_fit, problematic = analyze_component_for_fp16(tensors)
+        if all_fit:
+            target_dtype = torch.float16
+            precision_suffix = 'fp16'
+            print(f"    All tensors fit in fp16 range")
+        else:
+            target_dtype = torch.bfloat16
+            precision_suffix = 'bf16'
+            print(f"    {len(problematic)} tensor(s) exceed fp16 range, using bf16 for component")
+            for key, max_val in problematic[:3]:
+                print(f"      - {key}: max |value| = {max_val:.2e}")
+            if len(problematic) > 3:
+                print(f"      ... and {len(problematic) - 3} more")
+
+    # Track dtypes used (for mixed mode)
+    dtypes_used = set()
 
     for key, tensor in tensors.items():
-        source_bits = get_tensor_bits(tensor.dtype)
         original_dtype = tensor.dtype
+        source_bits = get_tensor_bits(tensor.dtype)
 
-        if explicit_precision:
-            # User explicitly requested a precision
-            new_tensor = convert_tensor_precision(
-                tensor, explicit_precision, component_name, key, explicit_request=True
-            )
-            precision_suffix = explicit_precision
+        if explicit_precision == 32:
+            # Keep as fp32 (or upscale if lower, which we don't do)
+            if source_bits < 32:
+                warnings.warn(
+                    f"[{component_name}] '{key}' is {source_bits}-bit. "
+                    f"Cannot upscale to 32-bit. Keeping original.",
+                    UserWarning
+                )
+                new_tensor = tensor
+            else:
+                new_tensor = tensor
+            precision_suffix = 'fp32'
+
+        elif explicit_precision == 16 or (needs_16bit_conversion and not keep_precision):
+            # Convert to 16-bit
+            if source_bits <= 16:
+                # Already 16-bit or lower, keep as is
+                new_tensor = tensor
+            else:
+                if mixed_dtype:
+                    # Per-tensor decision
+                    new_tensor = convert_tensor_to_16bit(tensor, force_bf16=False)
+                else:
+                    # Use component-wide decision
+                    new_tensor = tensor.to(target_dtype)
+
+                # Validate conversion
+                conv_warnings = validate_conversion(tensor, new_tensor, key, component_name)
+                all_warnings.extend(conv_warnings)
+
+            dtypes_used.add(new_tensor.dtype)
 
         elif keep_precision:
             # Keep original precision
             new_tensor = tensor
 
         else:
-            # Default policy: downscale fp32 to fp16, except VAE
-            if source_bits > 16 and component_name != 'vae':
-                new_tensor = convert_tensor_precision(
-                    tensor, DEFAULT_DOWNSCALE_PRECISION, component_name, key, explicit_request=False
-                )
-            else:
-                # fp16, bf16, fp8, or VAE - keep as is
-                new_tensor = tensor
+            # Default: keep as is (VAE or already low precision)
+            new_tensor = tensor
 
         converted[key] = new_tensor
 
@@ -572,10 +686,28 @@ def apply_precision_policy(
         if new_tensor.dtype != original_dtype:
             conversion_stats[f"{original_dtype} → {new_tensor.dtype}"] += 1
 
+    # Determine precision suffix for mixed mode
+    if mixed_dtype and needs_16bit_conversion:
+        if torch.float16 in dtypes_used and torch.bfloat16 in dtypes_used:
+            precision_suffix = 'fp16_bf16_mixed'
+            warnings.warn(
+                f"[{component_name}] Output file contains mixed fp16/bf16 tensors. "
+                "This may not be compatible with all model loaders.",
+                UserWarning
+            )
+        elif torch.bfloat16 in dtypes_used:
+            precision_suffix = 'bf16'
+        elif torch.float16 in dtypes_used:
+            precision_suffix = 'fp16'
+
     # Log conversions
     if conversion_stats:
         for conv, count in conversion_stats.items():
             print(f"    Converted {count} tensors: {conv}")
+
+    # Log validation warnings
+    for w in all_warnings:
+        warnings.warn(w, UserWarning)
 
     return converted, precision_suffix
 
@@ -643,7 +775,8 @@ def extract_components(
     precision_map=None,
     keep_precision=False,
     keep_original_keys=False,
-    force_architecture=None
+    force_architecture=None,
+    mixed_dtype=False
 ):
     """
     Extract components from a checkpoint file.
@@ -652,10 +785,11 @@ def extract_components(
         input_path: Path to .safetensors file
         output_dir: Output directory
         components_to_extract: List of components to extract (None = all detected)
-        precision_map: Dict mapping component names to explicit target precision
+        precision_map: Dict mapping component names to explicit target precision (16 or 32)
         keep_precision: If True, preserve original precision (unless overridden by precision_map)
         keep_original_keys: Don't transform keys
         force_architecture: Override auto-detection
+        mixed_dtype: Allow mixed fp16/bf16 per tensor
     """
     precision_map = precision_map or {}
 
@@ -687,7 +821,11 @@ def extract_components(
     if keep_precision:
         print("Precision policy: keep original")
     else:
-        print(f"Precision policy: downscale fp32 → {DEFAULT_DOWNSCALE_PRECISION} (except VAE)")
+        print("Precision policy: downscale fp32 → 16-bit adaptive (fp16 if fits, else bf16)")
+        print("                  VAE keeps original precision")
+
+    if mixed_dtype:
+        print("Mixed dtype mode: enabled (per-tensor fp16/bf16 decision)")
 
     # Load full state dict
     print("\nLoading tensors...")
@@ -771,7 +909,8 @@ def extract_components(
             tensors,
             comp,
             explicit_precision=explicit_precision,
-            keep_precision=keep_precision
+            keep_precision=keep_precision,
+            mixed_dtype=mixed_dtype
         )
 
         # Build filename
@@ -835,7 +974,7 @@ Examples:
   # Analyze checkpoint structure
   %(prog)s -i model.safetensors --analyze
 
-  # Extract all components (fp32 auto-downscaled to fp16)
+  # Extract all components (fp32 auto-downscaled to 16-bit)
   %(prog)s -i model.safetensors -d ./extracted
 
   # Extract keeping original precision
@@ -844,18 +983,21 @@ Examples:
   # Extract only VAE and UNet
   %(prog)s -i model.safetensors -d ./extracted -c vae -c unet
 
-  # Keep precision but force VAE to fp16
-  %(prog)s -i model.safetensors -d ./extracted -k --vae-precision fp16
+  # Force VAE to 16-bit precision
+  %(prog)s -i model.safetensors -d ./extracted --vae-precision 16
+
+  # Allow mixed fp16/bf16 per tensor
+  %(prog)s -i model.safetensors -d ./extracted -m
 
   # List available components
   %(prog)s -i model.safetensors --list
 
 Precision policy:
-  - Default: fp32 tensors are downscaled to fp16, fp8/fp16 are kept as-is
+  - Default: fp32 tensors are downscaled to 16-bit (fp16 if values fit, bf16 otherwise)
   - Exception: VAE always keeps original precision (for quality)
   - With -k/--keep-precision: all tensors keep original precision
   - Explicit --*-precision flags override the policy for that component
-  - Upscaling (e.g., fp16 to fp32) is never done; a warning is shown
+  - With -m/--mixed-dtype: per-tensor fp16/bf16 decision (may cause compatibility issues)
 
 Supported architectures: SDXL, SD15, Flux, Lumina, PixArt, HunyuanDiT
 Unknown architectures are handled with generic pattern matching.
@@ -878,7 +1020,13 @@ Unknown architectures are handled with generic pattern matching.
     parser.add_argument(
         '-k', '--keep-precision',
         action='store_true',
-        help='Keep original precision (default: downscale fp32 to fp16)'
+        help='Keep original precision (default: downscale fp32 to 16-bit)'
+    )
+
+    parser.add_argument(
+        '-m', '--mixed-dtype',
+        action='store_true',
+        help='Allow mixed fp16/bf16 per tensor (may cause compatibility issues)'
     )
 
     parser.add_argument(
@@ -893,13 +1041,14 @@ Unknown architectures are handled with generic pattern matching.
         help='Keep original keys (for debugging)'
     )
 
-    # Precision options
+    # Precision options (now accept 16 or 32)
     for comp in ['vae', 'unet', 'transformer', 'dit', 'clip', 'clip_l', 'clip_g',
                  't5', 'text_encoder', 'text_encoder_2']:
         parser.add_argument(
             f'--{comp.replace("_", "-")}-precision',
-            choices=['fp32', 'fp16', 'bf16', 'fp8'],
-            help=f'Target precision for {comp}'
+            type=int,
+            choices=[16, 32],
+            help=f'Target precision for {comp} (16 or 32 bits)'
         )
 
     args = parser.parse_args()
@@ -947,7 +1096,8 @@ Unknown architectures are handled with generic pattern matching.
             precision_map=precision_map,
             keep_precision=args.keep_precision,
             keep_original_keys=args.keep_original_keys,
-            force_architecture=args.force_architecture
+            force_architecture=args.force_architecture,
+            mixed_dtype=args.mixed_dtype
         )
         return 0
     except Exception as e:
