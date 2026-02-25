@@ -11,7 +11,7 @@ Quantization strategy (based on ViT-bigG-14, 32 transformer blocks):
     - MLP weights (c_fc, c_proj) in intermediate blocks  -> float8_e4m3fn
     - in_proj_weight (fused Q/K/V) in intermediate blocks -> float8_e4m3fn
     - Attention out_proj.weight in intermediate blocks    -> float16 (opt-in FP8 via --attn-out-fp8)
-    - First N blocks (--first-blocks-keep) + last block   -> float16 (preserved)
+    - First N blocks (--keep-first-blocks) + last block   -> float16 (preserved)
     - All biases                                          -> float16
     - LayerNorm, embeddings, projection, logit_scale      -> float16
 
@@ -63,7 +63,7 @@ Usage:
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --dry-run --verbose
 
     # Adjust number of preserved initial blocks
-    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --first-blocks-keep 8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --keep-first-blocks 8
 
     # Analyze tensors to identify sensitive blocks before quantizing
     python quantize-clip_g.py -i clip_g.safetensors --analyze
@@ -546,7 +546,7 @@ def analyze(input_path: Path):
         print(f"  Recommendation: consider protecting blocks {block_list}")
         print(f"  These blocks show significantly higher quantization error than average.")
 
-        # Recommend the minimum --first-blocks-keep that covers all sensitive blocks.
+        # Recommend the minimum --keep-first-blocks that covers all sensitive blocks.
         # If all sensitive blocks are below TOTAL_BLOCKS - 1 (last block is always protected),
         # suggest a contiguous range 0..max_sensitive to keep the recommendation simple.
         non_last_sensitive = [b for b in sensitive_blocks if b < TOTAL_BLOCKS - 1]
@@ -556,12 +556,12 @@ def analyze(input_path: Path):
             is_prefix = all(b < suggested_keep for b in non_last_sensitive) and \
                         len(non_last_sensitive) == suggested_keep
             if is_prefix:
-                print(f"  Suggested --first-blocks-keep: {suggested_keep} "
+                print(f"  Suggested --keep-first-blocks: {suggested_keep} "
                       f"(covers sensitive blocks 0-{suggested_keep - 1})")
             else:
                 # Sensitive blocks are not a contiguous prefix: recommend the covering
                 # contiguous range and also show the exact set for -k enumeration.
-                print(f"  Suggested --first-blocks-keep: {suggested_keep} "
+                print(f"  Suggested --keep-first-blocks: {suggested_keep} "
                       f"(contiguous range 0-{suggested_keep - 1} covering all sensitive blocks)")
                 exact_spec = ",".join(str(b) for b in non_last_sensitive)
                 print(f"  Alternatively, protect only sensitive blocks with: -k {exact_spec}")
@@ -575,7 +575,7 @@ def analyze(input_path: Path):
                   f"(block {last_block} is always protected).")
     else:
         print("  No blocks show significantly elevated quantization error.")
-        print("  The default --first-blocks-keep value should be adequate.")
+        print("  The default --keep-first-blocks value should be adequate.")
 
     print()
 
@@ -615,7 +615,7 @@ def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
 
     if not elevated:
         print("  All intermediate blocks show acceptable out_proj QError (<8%).")
-        print("  --attn-out-fp8 is safe to use with any --first-blocks-keep value.")
+        print("  --attn-out-fp8 is safe to use with any --keep-first-blocks value.")
         print()
         return
 
@@ -640,7 +640,7 @@ def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
     print()
 
     # Determine which elevated blocks would be exposed for different keep values
-    # Find the minimum --first-blocks-keep that covers all high-risk out_proj blocks
+    # Find the minimum --keep-first-blocks that covers all high-risk out_proj blocks
     high_blocks   = sorted(high.keys())
     elev_blocks   = sorted(elevated.keys())
 
@@ -649,25 +649,25 @@ def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
         print(f"  WARNING: {len(high_blocks)} block(s) with out_proj QError ≥ 12%: "
               f"{', '.join(str(b) for b in high_blocks)}")
         print(f"           --attn-out-fp8 is strongly discouraged unless "
-              f"--first-blocks-keep >= {min_keep_high}.")
+              f"--keep-first-blocks >= {min_keep_high}.")
 
     if elev_blocks:
         min_keep_elev = max(elev_blocks) + 1
         print(f"  CAUTION:  {len(elev_blocks)} block(s) with out_proj QError ≥ 8%: "
               f"{', '.join(str(b) for b in elev_blocks)}")
-        print(f"           To safely use --attn-out-fp8, set --first-blocks-keep >= {min_keep_elev}.")
+        print(f"           To safely use --attn-out-fp8, set --keep-first-blocks >= {min_keep_elev}.")
 
-    # Cross-reference with general --first-blocks-keep recommendation
+    # Cross-reference with general --keep-first-blocks recommendation
     if sensitive_blocks:
         non_last_sensitive = [b for b in sensitive_blocks if b < TOTAL_BLOCKS - 1]
         if non_last_sensitive:
             effective_keep = max(non_last_sensitive) + 1
             remaining_elev = [b for b in elev_blocks if b >= effective_keep]
             if remaining_elev:
-                print(f"  With the suggested --first-blocks-keep {effective_keep}, blocks "
+                print(f"  With the suggested --keep-first-blocks {effective_keep}, blocks "
                       f"{', '.join(str(b) for b in remaining_elev)} would still be exposed "
                       f"to out_proj quantization.")
-                print(f"  Consider omitting --attn-out-fp8 or raising --first-blocks-keep "
+                print(f"  Consider omitting --attn-out-fp8 or raising --keep-first-blocks "
                       f"to {max(remaining_elev) + 1}.")
 
     print()
@@ -725,7 +725,7 @@ def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
     min_keep_kv = max(elev_blocks) + 1
     print(f"  CAUTION: {len(elev_blocks)} block(s) with elevated Q/K/V QError (≥6%): "
           f"{', '.join(str(b) for b in elev_blocks)}")
-    print(f"           To safely use Q/K/V FP8, set --first-blocks-keep >= {min_keep_kv},")
+    print(f"           To safely use Q/K/V FP8, set --keep-first-blocks >= {min_keep_kv},")
     print(f"           or use --split-attn-qkv q16,kv16 to keep Q/K/V at FP16 after the split.")
     print()
 
@@ -998,7 +998,7 @@ def main():
              "(not required when using --analyze)"
     )
     parser.add_argument(
-        "--first-blocks-keep", "-k", type=str, default=str(DEFAULT_KEEP),
+        "--keep-first-blocks", "-k", type=str, default=str(DEFAULT_KEEP),
         metavar="SPEC",
         help=(
             f"Blocks to keep at FP16. Accepts a single integer n (protect blocks 0..n-1), "
@@ -1067,9 +1067,9 @@ def main():
 
     # Parse block-keep specification
     try:
-        protected_blocks = parse_keep_spec(args.first_blocks_keep)
+        protected_blocks = parse_keep_spec(args.keep_first_blocks)
     except ValueError as e:
-        print(f"ERROR: Invalid --first-blocks-keep value: {e}", file=sys.stderr)
+        print(f"ERROR: Invalid --keep-first-blocks value: {e}", file=sys.stderr)
         sys.exit(1)
 
     # Always protect the last block

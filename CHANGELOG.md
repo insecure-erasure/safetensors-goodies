@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.6] - Rename --first-blocks-keep to --keep-first-blocks; add --help to README
+
+### Changed (`quantize-clip_g.py`)
+
+- `--first-blocks-keep` / `-k` renamed to `--keep-first-blocks` / `-k` for consistency with the `verb-object` naming convention used elsewhere in the CLI.
+
+### Changed (docs)
+
+- `README.md`: added verbatim `--help` output for both `safetensors-extract.py` and `quantize-clip_g.py` under each script section.
+- `doc/quantize-clip_g.md`: all references to `--first-blocks-keep` updated to `--keep-first-blocks`.
+
+---
+
 ## [1.1.5] - Analyze mode handles pre-split safetensors files
 
 ### Added (`quantize-clip_g.py`)
@@ -21,7 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added (`quantize-clip_g.py`)
 
-- **`--first-blocks-keep` / `-k` now accepts ranges and enumerations** in addition to a single integer. Valid formats: `7` (protect blocks 0–6, legacy), `0-6` (explicit range), `0-3,5-6` (multiple ranges), `0,1,4,5` (enumeration). The last block (31) is always protected regardless of the spec.
+- **`--keep-first-blocks` / `-k` now accepts ranges and enumerations** in addition to a single integer. Valid formats: `7` (protect blocks 0–6, legacy), `0-6` (explicit range), `0-3,5-6` (multiple ranges), `0,1,4,5` (enumeration). The last block (31) is always protected regardless of the spec.
 - `parse_keep_spec()`: parses a `-k` spec string into a set of block indices. Raises `ValueError` with a descriptive message on invalid input.
 - `is_block_protected()`: replaces the previous `block_idx < first_keep or block_idx == last_block` inline checks throughout `convert()`.
 - When sensitive blocks in `--analyze` do not form a contiguous prefix, the recommendation now shows both the covering contiguous range and the exact `-k` enumeration for surgical protection.
@@ -63,7 +76,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added (`quantize-clip_g.py`)
 
-- **`--in-proj-fp8`**: quantizes `attn.in_proj_weight` to FP8 as a fused tensor, without splitting into Q/K/V. Applies only to intermediate blocks (respects `--first-blocks-keep` and the always-protected last block). Incompatible with `--split-attn-qkv`; an explicit error is raised if both flags are passed together.
+- **`--in-proj-fp8`**: quantizes `attn.in_proj_weight` to FP8 as a fused tensor, without splitting into Q/K/V. Applies only to intermediate blocks (respects `--keep-first-blocks` and the always-protected last block). Incompatible with `--split-attn-qkv`; an explicit error is raised if both flags are passed together.
 - `FP8_IN_PROJ_SUFFIX` constant for the fused `attn.in_proj_weight` suffix.
 - `build_fp8_suffixes()` now accepts `in_proj_fp8` parameter; adds `FP8_IN_PROJ_SUFFIX` to the candidate set when `--in-proj-fp8` is active and `--split-attn-qkv` is not.
 - Startup summary now reports `in_proj_weight : fused FP8 (--in-proj-fp8)` when the flag is active, instead of the default FP16 notice.
@@ -80,8 +93,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added (`quantize-clip_g.py`)
 
-- **`--attn-out-fp8` impact analysis** section in `--analyze` mode: reports per-block quantization error for `attn.out_proj.weight` across all intermediate blocks, classifies risk (ok / ELEVATED ≥8% / HIGH ≥12%), and recommends the minimum `--first-blocks-keep` value needed to safely use `--attn-out-fp8`. Cross-references with the general block sensitivity recommendation.
-- **`--split-attn-qkv` K/V impact analysis** section in `--analyze` mode: reports per-block quantization error for K and V projections (derived from `in_proj_weight`) across all intermediate blocks, flags blocks with QError ≥ 6% as elevated, and recommends `--first-blocks-keep` or `--keep-attn-kv-fp16` as mitigations.
+- **`--attn-out-fp8` impact analysis** section in `--analyze` mode: reports per-block quantization error for `attn.out_proj.weight` across all intermediate blocks, classifies risk (ok / ELEVATED ≥8% / HIGH ≥12%), and recommends the minimum `--keep-first-blocks` value needed to safely use `--attn-out-fp8`. Cross-references with the general block sensitivity recommendation.
+- **`--split-attn-qkv` K/V impact analysis** section in `--analyze` mode: reports per-block quantization error for K and V projections (derived from `in_proj_weight`) across all intermediate blocks, flags blocks with QError ≥ 6% as elevated, and recommends `--keep-first-blocks` or `--keep-attn-kv-fp16` as mitigations.
 - `COMPONENT_DISPLAY_NAMES` and `IN_PROJ_CHILD_NAMES` dicts: centralize component display name mapping used in the analysis output.
 - `WARN_THRESHOLD_OUT_PROJ` (0.08) and `WARN_THRESHOLD_HIGH` (0.12) constants for `--attn-out-fp8` risk classification.
 - `block_raw` dict in `analyze()`: parallel per-block storage keyed by raw suffix, used by the flag-specific analysis helpers.
@@ -95,7 +108,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **`quantize-clip_g.py`**: mixed FP16/FP8 (`float8_e4m3fn`) quantization for a CLIP-G text encoder extracted from an SDXL checkpoint in OpenCLIP format (`transformer.resblocks.N.*`). Output is compatible with ComfyUI-GGUF's `DualCLIPLoaderGGUF` node.
 
-- **Conservative quantization mode** (default): quantizes only `mlp.c_fc.weight` and `mlp.c_proj.weight` in intermediate blocks. All attention tensors, biases, LayerNorm parameters, embeddings, and projection tensors remain at FP16. First N blocks (`--first-blocks-keep`, default 7) and the last block (index 31) are always preserved at FP16.
+- **Conservative quantization mode** (default): quantizes only `mlp.c_fc.weight` and `mlp.c_proj.weight` in intermediate blocks. All attention tensors, biases, LayerNorm parameters, embeddings, and projection tensors remain at FP16. First N blocks (`--keep-first-blocks`, default 7) and the last block (index 31) are always preserved at FP16.
 
 - **`--split-attn-qkv`**: splits the fused `attn.in_proj_weight` [Q;K;V] tensor into separate `attn.q_proj.weight`, `attn.k_proj.weight`, and `attn.v_proj.weight` tensors. Also splits `attn.in_proj_bias` into `attn.q_proj.bias`, `attn.k_proj.bias`, and `attn.v_proj.bias`. By default K and V are quantized to FP8; Q stays at FP16.
 
@@ -105,9 +118,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **`--attn-out-fp8`**: quantizes `attn.out_proj.weight` to FP8 in intermediate blocks. Works independently of `--split-attn-qkv` because `out_proj` is already a separate tensor in the original format.
 
-- **`--analyze` mode**: analyzes all weight tensors per block and prints quantization sensitivity metrics (Frobenius norm, max absolute value, std, outlier count and percentage relative to FP8 E4M3 range, and roundtrip NRMSE from FP16 → FP8 → FP16). Ranks blocks by weighted average quantization error, flags sensitive blocks (error > mean + 1 std), and emits a recommendation for `--first-blocks-keep`. The fused `in_proj_weight` is analyzed both as a whole and split into Q/K/V components.
+- **`--analyze` mode**: analyzes all weight tensors per block and prints quantization sensitivity metrics (Frobenius norm, max absolute value, std, outlier count and percentage relative to FP8 E4M3 range, and roundtrip NRMSE from FP16 → FP8 → FP16). Ranks blocks by weighted average quantization error, flags sensitive blocks (error > mean + 1 std), and emits a recommendation for `--keep-first-blocks`. The fused `in_proj_weight` is analyzed both as a whole and split into Q/K/V components.
 
-- **`--first-blocks-keep` / `-k`**: sets the number of initial blocks to preserve at FP16 (default: 7).
+- **`--keep-first-blocks` / `-k`**: sets the number of initial blocks to preserve at FP16 (default: 7).
 
 - **`--dry-run`**: computes and prints the conversion summary without writing any file.
 
