@@ -289,12 +289,24 @@ def log_tensor(key: str, src_dtype: torch.dtype, dst_dtype: torch.dtype, verbose
 # ---------------------------------------------------------------------------
 
 # Weight suffixes to include in per-block analysis.
-# These are all the weight tensors that could potentially be quantized.
+# Covers both fused format (attn.in_proj_weight) and pre-split format
+# (attn.{q,k,v}_proj.weight) so that files produced with --split-attn-qkv
+# are analyzed correctly.
 ANALYSIS_WEIGHT_SUFFIXES = {
     "mlp.c_fc.weight",
     "mlp.c_proj.weight",
-    "attn.in_proj_weight",   # fused Q/K/V (will be analyzed as a whole and split)
+    "attn.in_proj_weight",    # fused Q/K/V  (original / protected-block format)
+    "attn.q_proj.weight",     # split Q      (produced by --split-attn-qkv)
+    "attn.k_proj.weight",     # split K
+    "attn.v_proj.weight",     # split V
     "attn.out_proj.weight",
+}
+
+# Suffixes that represent the already-split Q/K/V projections
+SPLIT_QKV_SUFFIXES = {
+    "attn.q_proj.weight",
+    "attn.k_proj.weight",
+    "attn.v_proj.weight",
 }
 
 # Friendly display names for components
@@ -391,9 +403,8 @@ def analyze(input_path: Path):
             block_raw[block_idx]  = {}
 
         if suffix == IN_PROJ_WEIGHT:
-            # Analyze the fused tensor as a whole
+            # Fused format: analyze the whole tensor and derive Q/K/V by splitting
             block_data[block_idx]["attn.in_proj_weight"] = analyze_tensor(tensor)
-            # Also analyze Q/K/V components separately
             q, k, v = split_in_proj(tensor)
             block_data[block_idx]["attn.q_proj.weight"] = analyze_tensor(q)
             block_data[block_idx]["attn.k_proj.weight"] = analyze_tensor(k)
@@ -401,6 +412,23 @@ def analyze(input_path: Path):
             block_raw[block_idx]["attn.q_proj.weight"] = block_data[block_idx]["attn.q_proj.weight"]
             block_raw[block_idx]["attn.k_proj.weight"] = block_data[block_idx]["attn.k_proj.weight"]
             block_raw[block_idx]["attn.v_proj.weight"] = block_data[block_idx]["attn.v_proj.weight"]
+            block_data[block_idx]["_in_proj_source"] = "fused"
+        elif suffix in SPLIT_QKV_SUFFIXES:
+            # Pre-split format: Q/K/V arrive as separate tensors.
+            metrics = analyze_tensor(tensor)
+            block_data[block_idx][suffix] = metrics
+            block_raw[block_idx][suffix]  = metrics
+            # Accumulate tensors to build a synthetic fused summary row once all three are seen.
+            staging = block_data[block_idx].setdefault("_qkv_staging", {})
+            staging[suffix] = tensor
+            if len(staging) == 3:
+                fused = torch.cat([
+                    staging["attn.q_proj.weight"],
+                    staging["attn.k_proj.weight"],
+                    staging["attn.v_proj.weight"],
+                ], dim=0)
+                block_data[block_idx]["attn.in_proj_weight"] = analyze_tensor(fused)
+                block_data[block_idx]["_in_proj_source"] = "split"
         else:
             name = COMPONENT_DISPLAY_NAMES.get(suffix, suffix)
             metrics = analyze_tensor(tensor)
@@ -410,6 +438,11 @@ def analyze(input_path: Path):
     if not block_data:
         print("No resblock weight tensors found in the file.")
         return
+
+    # Remove internal staging keys used during ingestion
+    for bd in block_data.values():
+        bd.pop("_qkv_staging", None)
+        bd.pop("_in_proj_source", None)
 
     # --- Per-block detailed report ---
     # Column widths: component column needs extra space for indented children

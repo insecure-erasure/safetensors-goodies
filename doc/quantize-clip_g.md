@@ -182,7 +182,14 @@ Blocks are ranked by their **weighted average quantization error** (across all q
 
 The recommendation section suggests a `--first-blocks-keep` value covering all sensitive blocks. When sensitive blocks do not form a contiguous prefix, both the covering contiguous range and the exact `-k` enumeration are shown.
 
-The fused `in_proj_weight` is analyzed both as a whole and split into Q, K, V components. The Q/K/V rows are rendered indented under `attn.in_proj_weight` using a tree-style layout (`├─` / `└─`).
+### Files produced with --split-attn-qkv
+
+`--analyze` handles both formats transparently:
+
+- **Fused format** (original files or protected blocks): `attn.in_proj_weight` is split internally into Q/K/V for per-component metrics.
+- **Pre-split format** (files produced with `--split-attn-qkv`): Q/K/V arrive as separate tensors. The script accumulates them and synthesizes a fused `attn.in_proj_weight` summary row by concatenating the three tensors along dimension 0.
+
+In both cases the per-block table shows the same set of rows.
 
 After the general block ranking, the analysis mode emits two additional sections:
 

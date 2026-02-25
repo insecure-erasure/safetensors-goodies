@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.5] - Analyze mode handles pre-split safetensors files
+
+### Added (`quantize-clip_g.py`)
+
+- `--analyze` now works correctly on files produced with `--split-attn-qkv`, where `attn.q_proj.weight`, `attn.k_proj.weight`, and `attn.v_proj.weight` exist as separate tensors instead of a fused `attn.in_proj_weight`. The three tensors are accumulated via a `_qkv_staging` dict and concatenated into a synthetic fused tensor to produce the `attn.in_proj_weight` summary row, keeping the per-block table layout consistent across both formats.
+- `SPLIT_QKV_SUFFIXES` constant: set of the three split projection suffixes, used to detect pre-split blocks during analysis ingestion.
+- `attn.q_proj.weight`, `attn.k_proj.weight`, and `attn.v_proj.weight` added to `ANALYSIS_WEIGHT_SUFFIXES` so they are picked up when iterating the state dict.
+- Internal `_qkv_staging` and `_in_proj_source` keys are cleaned up from `block_data` after ingestion.
+
+---
+
 ## [1.1.4] - Flexible block protection and analysis output improvements
 
 ### Added (`quantize-clip_g.py`)
