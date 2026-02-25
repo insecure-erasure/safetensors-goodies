@@ -36,48 +36,53 @@ The following tensors in blocks `first_keep` through 30 are candidates for FP8 q
 |---|---|---|
 | `mlp.c_fc.weight` | ✅ FP8 | — |
 | `mlp.c_proj.weight` | ✅ FP8 | — |
+| `attn.in_proj_weight` *(fused)* | ✅ FP8 | — |
 | `attn.out_proj.weight` | FP16 | `--attn-out-fp8` |
-| `attn.in_proj_weight` *(fused)* | FP16 | `--in-proj-fp8` |
-| `attn.k_proj.weight` *(split)* | FP8 | `--split-attn-qkv` |
-| `attn.v_proj.weight` *(split)* | FP8 | `--split-attn-qkv` |
-| `attn.q_proj.weight` *(split)* | FP16 | `--split-attn-qkv --attn-q-fp8` |
+| `attn.k_proj.weight` *(split)* | FP8 | `--split-attn-qkv [q16,kv8 \| q8,kv8 \| q8,kv16]` |
+| `attn.v_proj.weight` *(split)* | FP8 | `--split-attn-qkv [q16,kv8 \| q8,kv8 \| q8,kv16]` |
+| `attn.q_proj.weight` *(split)* | FP16 | `--split-attn-qkv [q8,kv8 \| q8,kv16]` |
 
 ### Fused attention weights (`in_proj_weight`)
 
-The original OpenCLIP format stores Q, K, and V projections as a single fused tensor (`attn.in_proj_weight`). By default the script leaves this tensor intact at FP16.
+The original OpenCLIP format stores Q, K, and V projections as a single fused tensor (`attn.in_proj_weight`). By default the script quantizes this tensor to FP8 directly, without splitting.
 
-With `--in-proj-fp8`, the fused tensor is quantized to FP8 directly, without splitting. This is the lower-risk alternative to `--split-attn-qkv` when the goal is simply to reduce the memory footprint of the attention input projection. Check the `attn.in_proj_weight` QError in `--analyze` output before using this flag. **Incompatible with `--split-attn-qkv`.**
-
-With `--split-attn-qkv`, the fused tensor is split into three separate tensors (`attn.q_proj.weight`, `attn.k_proj.weight`, `attn.v_proj.weight`) and the corresponding bias is split into `attn.q_proj.bias`, `attn.k_proj.bias`, `attn.v_proj.bias`. Splitting replaces 2 tensors (weight + bias) with 6, for a net gain of +4 tensors per eligible block.
+With `--split-attn-qkv`, the fused tensor is split into three separate tensors (`attn.q_proj.weight`, `attn.k_proj.weight`, `attn.v_proj.weight`) and the corresponding bias is split into `attn.q_proj.bias`, `attn.k_proj.bias`, `attn.v_proj.bias`. Splitting replaces 2 tensors (weight + bias) with 6, for a net gain of +4 tensors per eligible block. The precision of each component is controlled by the split mode (see below).
 
 ---
 
 ## Usage
 
-### Conservative (MLP only)
+### Default (MLP + fused in_proj_weight to FP8)
 
 ```bash
 python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors
 ```
 
-Quantizes only `mlp.c_fc.weight` and `mlp.c_proj.weight` in intermediate blocks. All attention tensors remain at FP16, fused.
+Quantizes `mlp.c_fc.weight`, `mlp.c_proj.weight`, and `attn.in_proj_weight` (fused) in intermediate blocks. All other attention tensors remain at FP16.
 
-### Split attention and quantize K/V
+### Split attention: Q FP16, K/V FP8 (default split mode)
 
 ```bash
 python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv
 ```
 
-Splits `in_proj_weight` into Q/K/V tensors. K and V are quantized to FP8; Q stays at FP16.
+Splits `in_proj_weight` into Q/K/V. K and V are quantized to FP8; Q stays at FP16. Equivalent to `--split-attn-qkv q16,kv8`.
 
-### Isolate the impact of the split vs K/V quantization
+### Split attention modes
 
 ```bash
-python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
-    --split-attn-qkv --keep-attn-kv-fp16
-```
+# Q FP16, K/V FP8 (default when no mode is specified)
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q16,kv8
 
-Splits the fused tensor but keeps all resulting Q/K/V tensors at FP16. Useful for diagnosing whether quality changes come from the structural split or from K/V quantization.
+# Q, K, V all FP8
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q8,kv8
+
+# Q FP8, K/V FP16
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q8,kv16
+
+# Split only, no quantization of Q/K/V
+python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q16,kv16
+```
 
 ### Add out_proj quantization (independent of split)
 
@@ -85,16 +90,12 @@ Splits the fused tensor but keeps all resulting Q/K/V tensors at FP16. Useful fo
 python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --attn-out-fp8
 ```
 
-`out_proj.weight` is already a separate tensor in the original format, so `--attn-out-fp8` works independently of `--split-attn-qkv`.
-
 ### Maximum quantization
 
 ```bash
 python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
-    --split-attn-qkv --attn-q-fp8 --attn-out-fp8
+    --split-attn-qkv q8,kv8 --attn-out-fp8
 ```
-
-Quantizes all weight tensors that can be quantized in intermediate blocks: MLP c_fc, MLP c_proj, Q, K, V, and out_proj.
 
 ### Analyze before quantizing
 
@@ -102,7 +103,7 @@ Quantizes all weight tensors that can be quantized in intermediate blocks: MLP c
 python quantize-clip_g.py -i clip_g.safetensors --analyze
 ```
 
-Prints per-block quantization sensitivity metrics (norm, max absolute value, std, outlier count, roundtrip error) and recommends which blocks to protect. Does not write any file. Only `--input` is required.
+Prints per-block quantization sensitivity metrics and recommendations. Does not write any file. Only `--input` is required.
 
 ### Adjust the number of protected initial blocks
 
@@ -128,13 +129,21 @@ python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
 | `--output` | `-o` | *(required unless `--analyze`)* | Output safetensors file |
 | `--first-blocks-keep` | `-k` | `7` | Number of initial blocks to preserve at FP16 (blocks 0 to N−1). Block 31 is always preserved. |
 | `--analyze` | | off | Analyze quantization sensitivity per block. Prints metrics and recommendations. Does not write any file. |
-| `--split-attn-qkv` | | off | Split fused `in_proj_weight` into separate Q/K/V tensors. Enables K/V FP8 quantization. |
-| `--keep-attn-kv-fp16` | | off | When splitting, keep K and V at FP16 instead of quantizing them. Requires `--split-attn-qkv`. |
-| `--attn-q-fp8` | | off | Quantize the Q projection to FP8 in intermediate blocks. Requires `--split-attn-qkv`. |
+| `--split-attn-qkv [MODE]` | | off | Split fused `in_proj_weight` into separate Q/K/V tensors. Optional mode controls per-component precision (see table below). When omitted, `in_proj_weight` is quantized to FP8 as a fused tensor. |
 | `--attn-out-fp8` | | off | Quantize `out_proj.weight` to FP8 in intermediate blocks. Does not require `--split-attn-qkv`. |
-| `--in-proj-fp8` | | off | Quantize `attn.in_proj_weight` to FP8 as a fused tensor (no split). Incompatible with `--split-attn-qkv`. Check `--analyze` output for `attn.in_proj_weight` QError before using. |
 | `--dry-run` | | off | Compute and print statistics without writing the output file. |
 | `--verbose` | `-v` | off | Print per-tensor dtype mapping and detailed outlier information. |
+
+### --split-attn-qkv modes
+
+| Mode | Q | K | V | Notes |
+|---|---|---|---|---|
+| `q16,kv8` | FP16 | FP8 | FP8 | Default when no mode is specified |
+| `q8,kv8` | FP8 | FP8 | FP8 | Maximum attention quantization |
+| `q8,kv16` | FP8 | FP16 | FP16 | Q only |
+| `q16,kv16` | FP16 | FP16 | FP16 | Split only, no quantization |
+
+When `--split-attn-qkv` is used without an explicit mode, the script prints a note confirming the default (`q16,kv8`).
 
 ---
 

@@ -7,20 +7,21 @@ from an SDXL checkpoint in OpenCLIP format (transformer.resblocks.N.*).
 
 Quantization strategy (based on ViT-bigG-14, 32 transformer blocks):
 
-  By default (conservative, no structural changes to the state dict):
+  By default (no structural changes to the state dict):
     - MLP weights (c_fc, c_proj) in intermediate blocks  -> float8_e4m3fn
+    - in_proj_weight (fused Q/K/V) in intermediate blocks -> float8_e4m3fn
     - Attention out_proj.weight in intermediate blocks    -> float16 (opt-in FP8 via --attn-out-fp8)
-    - in_proj_weight (fused Q/K/V) kept intact            -> float16
     - First N blocks (--first-blocks-keep) + last block   -> float16 (preserved)
     - All biases                                          -> float16
     - LayerNorm, embeddings, projection, logit_scale      -> float16
 
-  With --split-attn-qkv (splits in_proj_weight into separate Q/K/V tensors):
-    - K, V projections in intermediate blocks             -> float8_e4m3fn
-    - Q projection in intermediate blocks                 -> float16 (opt-in FP8 via --attn-q-fp8)
-    - in_proj_bias is also split into q/k/v biases        -> float16
-    - Use --keep-attn-kv-fp16 to keep K/V at FP16 after the split
-      (useful for isolating the impact of the split vs K/V quantization)
+  With --split-attn-qkv [mode] (splits in_proj_weight into separate Q/K/V):
+    Splits in_proj_weight and in_proj_bias into separate Q/K/V tensors
+    with configurable precision per component:
+      q16,kv8  - Q FP16, K/V FP8 (default if no mode given)
+      q8,kv8   - Q, K, V all FP8
+      q8,kv16  - Q FP8, K/V FP16
+      q16,kv16 - Q, K, V all FP16 (split only, no quantization)
 
   Note: --attn-out-fp8 works independently of --split-attn-qkv because
   out_proj.weight is already a separate tensor in the original state dict.
@@ -32,20 +33,23 @@ Requirements:
     pip install safetensors torch
 
 Usage:
-    # Conservative: only MLP weights quantized to FP8
+    # Default: MLP weights + fused in_proj_weight quantized to FP8
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors
 
-    # Split attention and quantize K/V to FP8
+    # Split attention: Q FP16, K/V FP8 (default split mode)
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv
 
-    # Split attention but keep K/V at FP16 (diagnostic: isolate split vs quantization)
-    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --keep-attn-kv-fp16
+    # Split attention: all Q/K/V to FP8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q8,kv8
+
+    # Split attention: split only, no quantization of Q/K/V
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q16,kv16
 
     # Also quantize out_proj (independent of split)
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --attn-out-fp8
 
-    # Maximum quantization: split + all attention weights to FP8
-    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --attn-q-fp8 --attn-out-fp8
+    # Maximum quantization: split Q/K/V all FP8 + out_proj FP8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv q8,kv8 --attn-out-fp8
 
     # Dry run with verbose per-tensor mapping
     python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --dry-run --verbose
@@ -92,8 +96,8 @@ FP8_ATTN_KV_SUFFIXES = {
 
 # Optional suffixes controlled by individual CLI flags
 FP8_ATTN_OUT_SUFFIX = "attn.out_proj.weight"  # --attn-out-fp8
-FP8_ATTN_Q_SUFFIX   = "attn.q_proj.weight"    # --attn-q-fp8
-FP8_IN_PROJ_SUFFIX  = "attn.in_proj_weight"   # --in-proj-fp8 (fused, no split)
+FP8_ATTN_Q_SUFFIX   = "attn.q_proj.weight"    # --split-attn-qkv q8,*
+FP8_IN_PROJ_SUFFIX  = "attn.in_proj_weight"   # default (fused, no split)
 
 # Regex to detect a resblock key and extract block index + suffix
 # Matches: transformer.resblocks.{N}.{suffix}
@@ -136,31 +140,30 @@ def to_fp8(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(torch.float32).to(torch.float8_e4m3fn)
 
 
-def build_fp8_suffixes(split_attn: bool, keep_kv_fp16: bool,
-                       attn_out_fp8: bool, attn_q_fp8: bool,
-                       in_proj_fp8: bool) -> set:
+def build_fp8_suffixes(split_mode: str, attn_out_fp8: bool) -> set:
     """
     Return the full set of weight suffixes to quantize to FP8 based on
     active flags.
 
     Base set: MLP weights (always included).
     Conditionally added:
-      - K/V projections: when --split-attn-qkv is set and --keep-attn-kv-fp16 is not
-      - Q projection:    when --split-attn-qkv and --attn-q-fp8 are both set
+      - in_proj_weight:  when split_mode is None (fused, always FP8 by default)
+      - K/V projections: when split_mode includes kv8
+      - Q projection:    when split_mode includes q8
       - out_proj:        when --attn-out-fp8 is set (independent of split)
-      - in_proj_weight:  when --in-proj-fp8 is set and --split-attn-qkv is NOT set
     """
     suffixes = set(FP8_MLP_SUFFIXES)
-    if split_attn and not keep_kv_fp16:
-        suffixes.update(FP8_ATTN_KV_SUFFIXES)
-    if split_attn and attn_q_fp8:
-        suffixes.add(FP8_ATTN_Q_SUFFIX)
+    if split_mode is None:
+        # No split: fused in_proj_weight goes to FP8 by default
+        suffixes.add(FP8_IN_PROJ_SUFFIX)
+    else:
+        # Split active: check per-component precision from mode string
+        if "kv8" in split_mode:
+            suffixes.update(FP8_ATTN_KV_SUFFIXES)
+        if split_mode.startswith("q8"):
+            suffixes.add(FP8_ATTN_Q_SUFFIX)
     if attn_out_fp8:
         suffixes.add(FP8_ATTN_OUT_SUFFIX)
-    # --in-proj-fp8 only applies when in_proj_weight is kept fused (no split)
-    # When --split-attn-qkv is active, Q/K/V are handled individually
-    if in_proj_fp8 and not split_attn:
-        suffixes.add(FP8_IN_PROJ_SUFFIX)
     return suffixes
 
 
@@ -600,7 +603,7 @@ def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
     print(f"  CAUTION: {len(elev_blocks)} block(s) with elevated K/V QError (≥6%): "
           f"{', '.join(str(b) for b in elev_blocks)}")
     print(f"           To safely use K/V FP8, set --first-blocks-keep >= {min_keep_kv},")
-    print(f"           or use --keep-attn-kv-fp16 to keep K/V at FP16 after the split.")
+    print(f"           or use --split-attn-qkv q16,kv16 to keep Q/K/V at FP16 after the split.")
     print()
 
 
@@ -609,14 +612,17 @@ def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
 # ---------------------------------------------------------------------------
 
 def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
-            split_attn: bool, keep_kv_fp16: bool, attn_q_fp8: bool, attn_out_fp8: bool,
-            in_proj_fp8: bool, verbose: bool):
+            split_mode: str, attn_out_fp8: bool, verbose: bool):
     if not check_fp8_support():
         print("ERROR: float8_e4m3fn is not available in this PyTorch build.")
         print("       Requires PyTorch >= 2.1 compiled with FP8 support.")
         sys.exit(1)
 
-    fp8_suffixes = build_fp8_suffixes(split_attn, keep_kv_fp16, attn_out_fp8, attn_q_fp8, in_proj_fp8)
+    split_attn = split_mode is not None
+    attn_q_fp8 = split_attn and split_mode.startswith("q8")
+    keep_kv_fp16 = split_attn and "kv16" in split_mode
+
+    fp8_suffixes = build_fp8_suffixes(split_mode, attn_out_fp8)
 
     print(f"Loading: {input_path}")
     sd_in = load_file(str(input_path))
@@ -624,16 +630,11 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
     print(f"  FP16 preserved : blocks 0-{first_keep-1} and block {TOTAL_BLOCKS-1}")
 
     if not split_attn:
-        fp8_desc = "MLP weights"
-        if in_proj_fp8:
-            fp8_desc += " + attn.in_proj_weight (fused)"
+        fp8_desc = "MLP weights + attn.in_proj_weight (fused)"
         if attn_out_fp8:
             fp8_desc += " + attn out_proj"
         print(f"  FP8 candidates : blocks {first_keep}-{TOTAL_BLOCKS-2} ({fp8_desc})")
-        if in_proj_fp8:
-            print(f"  in_proj_weight : fused FP8 (--in-proj-fp8)")
-        else:
-            print(f"  in_proj_weight : kept fused in FP16 (use --split-attn-qkv to split)")
+        print(f"  in_proj_weight : fused FP8 (default)")
     else:
         fp8_desc = "MLP weights"
         if keep_kv_fp16:
@@ -645,9 +646,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
         if attn_out_fp8:
             fp8_desc += " + attn out_proj"
         print(f"  FP8 candidates : blocks {first_keep}-{TOTAL_BLOCKS-2} ({fp8_desc})")
-        print(f"  Split attn     : enabled (in_proj_weight -> Q/K/V)")
-        if keep_kv_fp16:
-            print(f"  Keep K/V FP16  : enabled (--keep-attn-kv-fp16)")
+        print(f"  Split attn     : enabled (in_proj_weight -> Q/K/V, mode: {split_mode})")
     print()
 
     if verbose:
@@ -679,14 +678,14 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
             if not split_attn:
                 last_block = TOTAL_BLOCKS - 1
                 eligible = (block_idx >= first_keep) and (block_idx != last_block)
-                if in_proj_fp8 and eligible:
-                    # --in-proj-fp8: quantize fused tensor directly to FP8
+                if eligible:
+                    # Default: quantize fused tensor directly to FP8
                     check_outliers(tensor, key, verbose)
                     sd_out[key] = to_fp8(tensor)
                     log_tensor(key, tensor.dtype, torch.float8_e4m3fn, verbose)
                     stats["fp8"] += 1
                 else:
-                    # Default: keep the fused tensor intact at FP16
+                    # Protected block: keep the fused tensor at FP16
                     sd_out[key] = tensor.to(torch.float16)
                     log_tensor(key, tensor.dtype, torch.float16, verbose)
                     stats["fp16"] += 1
@@ -700,7 +699,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
             base = f"transformer.resblocks.{block_idx}"
 
             if eligible:
-                # Q: FP8 only if --attn-q-fp8 is set, otherwise FP16
+                # Q: FP8 only if split mode starts with q8, otherwise FP16
                 q_key = f"{base}.attn.q_proj.weight"
                 if attn_q_fp8:
                     check_outliers(q, q_key, verbose)
@@ -712,7 +711,7 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
                     log_tensor(q_key, tensor.dtype, torch.float16, verbose)
                     stats["fp16"] += 1
 
-                # K and V: FP8 by default, FP16 if --keep-attn-kv-fp16 is set
+                # K and V: FP8 by default, FP16 if split mode includes kv16
                 k_key = f"{base}.attn.k_proj.weight"
                 v_key = f"{base}.attn.v_proj.weight"
                 if keep_kv_fp16:
@@ -853,6 +852,10 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
 # ---------------------------------------------------------------------------
 
 def main():
+    # Valid modes for --split-attn-qkv
+    SPLIT_MODES = ["q16,kv8", "q8,kv8", "q8,kv16", "q16,kv16"]
+    DEFAULT_SPLIT_MODE = "q16,kv8"
+
     parser = argparse.ArgumentParser(
         description="Mixed FP16/FP8 quantization for CLIP-G (OpenCLIP format) safetensors"
     )
@@ -880,35 +883,22 @@ def main():
 
     # -- Attention split and quantization flags --
     parser.add_argument(
-        "--split-attn-qkv", action="store_true",
-        help="Split fused in_proj_weight into separate Q/K/V tensors (and biases). "
-             "By default K/V are quantized to FP8 in intermediate blocks; Q stays FP16. "
-             "Without this flag, in_proj_weight is kept intact in FP16."
-    )
-    parser.add_argument(
-        "--keep-attn-kv-fp16", action="store_true",
-        help="When splitting attention (--split-attn-qkv), keep K and V at FP16 "
-             "instead of quantizing them to FP8. Useful for diagnosing whether "
-             "quality changes come from the split itself or from K/V quantization. "
-             "Requires --split-attn-qkv."
-    )
-    parser.add_argument(
-        "--attn-q-fp8", action="store_true",
-        help="Quantize the attention Q projection to FP8 in intermediate blocks. "
-             "Q is the most sensitive attention component — validate results carefully. "
-             "Requires --split-attn-qkv."
+        "--split-attn-qkv", nargs="?", const=DEFAULT_SPLIT_MODE, default=None,
+        choices=SPLIT_MODES, metavar="MODE",
+        help="Split fused in_proj_weight into separate Q/K/V tensors (and biases), "
+             "with precision control per component. "
+             "Without this flag, in_proj_weight is quantized to FP8 as a fused tensor. "
+             "Options: "
+             f"{DEFAULT_SPLIT_MODE} - Q FP16, K/V FP8 (default if no value given); "
+             "q8,kv8 - Q, K, V all FP8; "
+             "q8,kv16 - Q FP8, K/V FP16; "
+             "q16,kv16 - Q, K, V all FP16 (split only, no quantization)"
     )
     parser.add_argument(
         "--attn-out-fp8", action="store_true",
         help="Quantize attention out_proj.weight to FP8 in intermediate blocks. "
              "Conservative extra savings with low quality risk. "
              "Does not require --split-attn-qkv (out_proj is already a separate tensor)."
-    )
-    parser.add_argument(
-        "--in-proj-fp8", action="store_true",
-        help="Quantize attn.in_proj_weight to FP8 as a fused tensor (no split). "
-             "Incompatible with --split-attn-qkv. Check --analyze output for "
-             "attn.in_proj_weight QError before using this flag."
     )
 
     # -- Output control --
@@ -948,33 +938,28 @@ def main():
         )
         sys.exit(1)
 
-    if args.keep_attn_kv_fp16 and not args.split_attn_qkv:
-        print(
-            "ERROR: --keep-attn-kv-fp16 requires --split-attn-qkv. "
-            "Without the split, K/V don't exist as separate tensors.",
-            file=sys.stderr
-        )
-        sys.exit(1)
-
-    if args.attn_q_fp8 and not args.split_attn_qkv:
-        print(
-            "ERROR: --attn-q-fp8 requires --split-attn-qkv. "
-            "Without the split, Q doesn't exist as a separate tensor.",
-            file=sys.stderr
-        )
-        sys.exit(1)
-
-    if args.in_proj_fp8 and args.split_attn_qkv:
-        print(
-            "ERROR: --in-proj-fp8 is incompatible with --split-attn-qkv. "
-            "When splitting, Q/K/V are handled individually.",
-            file=sys.stderr
-        )
-        sys.exit(1)
+    # Inform the user about the split mode when using the default
+    split_mode = args.split_attn_qkv
+    if split_mode is not None:
+        # Check if the user passed --split-attn-qkv without an explicit value
+        # by comparing with the const default
+        if split_mode == DEFAULT_SPLIT_MODE and f"--split-attn-qkv" in sys.argv:
+            # Determine if a value was explicitly given or if const was used
+            idx = None
+            for i, arg in enumerate(sys.argv):
+                if arg == "--split-attn-qkv":
+                    idx = i
+                    break
+            explicit = (idx is not None
+                        and idx + 1 < len(sys.argv)
+                        and sys.argv[idx + 1] in SPLIT_MODES)
+            if not explicit:
+                print(f"NOTE: --split-attn-qkv used without explicit mode. "
+                      f"Defaulting to {DEFAULT_SPLIT_MODE} (Q FP16, K/V FP8).")
+                print()
 
     convert(input_path, output_path, args.first_blocks_keep, args.dry_run,
-            args.split_attn_qkv, args.keep_attn_kv_fp16, args.attn_q_fp8,
-            args.attn_out_fp8, args.in_proj_fp8, args.verbose)
+            split_mode, args.attn_out_fp8, args.verbose)
 
 
 if __name__ == "__main__":

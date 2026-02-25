@@ -7,9 +7,29 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
-## [1.1.2] - Add --in-proj-fp8 flag to quantize-clip_g.py
+## [1.1.3] - Consolidate attention flags into --split-attn-qkv mode argument
 
 ### Changed (`quantize-clip_g.py`)
+
+- **`in_proj_weight` is now quantized to FP8 by default** (without any flag). Previously it was kept at FP16 unless `--in-proj-fp8` was passed.
+- **`--split-attn-qkv` now accepts an optional mode argument** controlling per-component precision. Valid modes: `q16,kv8` (default), `q8,kv8`, `q8,kv16`, `q16,kv16`. When used without an explicit mode, the script prints a note confirming the default.
+- `build_fp8_suffixes()` signature simplified to `(split_mode, attn_out_fp8)`. The `split_mode` string (or `None` for no split) replaces the previous `split_attn`, `keep_kv_fp16`, `attn_q_fp8`, and `in_proj_fp8` boolean parameters.
+- `convert()` signature simplified to `(... split_mode, attn_out_fp8, verbose)`. The `split_attn`, `keep_kv_fp16`, `attn_q_fp8`, and `in_proj_fp8` parameters are derived internally from `split_mode`.
+- Startup summary now reports `in_proj_weight : fused FP8 (default)` in the no-split path, and `Split attn : enabled (in_proj_weight -> Q/K/V, mode: {mode})` in the split path.
+- `_analyze_attn_kv_fp8()` recommendation updated to suggest `--split-attn-qkv q16,kv16` instead of the removed `--keep-attn-kv-fp16`.
+
+### Removed (`quantize-clip_g.py`)
+
+- `--keep-attn-kv-fp16` flag — replaced by `--split-attn-qkv q16,kv16` (or `q8,kv16` to keep only K/V at FP16 while quantizing Q).
+- `--attn-q-fp8` flag — replaced by `--split-attn-qkv q8,kv8` or `--split-attn-qkv q8,kv16`.
+- `--in-proj-fp8` flag — fused `in_proj_weight` quantization is now the default behaviour in the no-split path.
+- Validation errors for `--keep-attn-kv-fp16` and `--attn-q-fp8` without `--split-attn-qkv`, and for `--in-proj-fp8` combined with `--split-attn-qkv`.
+
+---
+
+## [1.1.2] - Add --in-proj-fp8 flag to quantize-clip_g.py
+
+### Added (`quantize-clip_g.py`)
 
 - **`--in-proj-fp8`**: quantizes `attn.in_proj_weight` to FP8 as a fused tensor, without splitting into Q/K/V. Applies only to intermediate blocks (respects `--first-blocks-keep` and the always-protected last block). Incompatible with `--split-attn-qkv`; an explicit error is raised if both flags are passed together.
 - `FP8_IN_PROJ_SUFFIX` constant for the fused `attn.in_proj_weight` suffix.
