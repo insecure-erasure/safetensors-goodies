@@ -17,7 +17,7 @@ A command-line utility to extract individual components from diffusion model che
 |---|---|---|---|
 | SDXL / Pony | UNet | ✓ | CLIP-L + CLIP-G |
 | SD 1.5 / 2.x | UNet | ✓ | CLIP |
-| Flux | Transformer | ✓ | CLIP + T5 |
+| Flux | Transformer | ✓ | CLIP-L + T5-XXL |
 | Lumina / zImage | DiT | ✓ | Text encoder |
 | PixArt | DiT | ✓ | Text encoder |
 | HunyuanDiT | DiT | ✓ | Text encoder + Text encoder 2 |
@@ -102,13 +102,13 @@ python safetensors-extract.py -i my_model.safetensors -d ./output --force-archit
 
 | Scenario | Behavior |
 |---|---|
-| Default (no flags) | fp32 → 16-bit adaptive (fp16 if all values fit within ±65504, else bf16); VAE always unchanged |
+| Default (no flags) | fp32 → 16-bit adaptive (fp16 if all values fit within ±65504, else bf16); float8 and VAE always unchanged |
 | `-k` / `--keep-precision` | All tensors keep original dtype |
 | `-m` / `--mixed-dtype` | Per-tensor fp16/bf16 decision instead of per-component; may produce mixed-dtype files |
-| `--{component}-precision 16` | That component uses adaptive 16-bit conversion |
+| `--{component}-precision 16` | That component uses adaptive 16-bit conversion (float8 tensors still kept as-is) |
 | `--{component}-precision 32` | That component keeps fp32 (upscaling is never done) |
 
-After every conversion, the script automatically checks for new infinities (overflow), values flushed to zero, and new NaNs. Issues are reported as warnings but do not abort extraction.
+After every conversion, the script automatically checks for new infinities (overflow), values flushed to zero, and new NaNs. Issues are reported as warnings but do not abort extraction. These checks are skipped for float8 tensors, as PyTorch does not implement `isinf`/`isnan` for those types.
 
 ## Output naming
 
@@ -137,6 +137,7 @@ After every conversion, the script automatically checks for new infinities (over
 | `--clip-precision` | Precision override for CLIP (SD15, Flux) |
 | `--clip-l-precision` | Precision override for CLIP-L (SDXL) |
 | `--clip-g-precision` | Precision override for CLIP-G (SDXL) |
-| `--t5-precision` | Precision override for T5 (Flux) |
+| `--t5-precision` | Precision override for T5 (Flux, generic) |
+| `--t5xxl-precision` | Precision override for T5-XXL (Flux) |
 | `--text-encoder-precision` | Precision override for text encoder |
 | `--text-encoder-2-precision` | Precision override for second text encoder |

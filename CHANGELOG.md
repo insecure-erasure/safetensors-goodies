@@ -7,6 +7,25 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.2] - Float8 support and Flux text encoder fixes
+
+### Added
+
+- **Float8 dtype support** (`torch.float8_e4m3fn`, `torch.float8_e5m2`): entries added to `DTYPE_BITS` conditionally at import time to maintain compatibility with PyTorch < 2.1, which does not have these types.
+- `is_float8_dtype()` helper: centralizes float8 detection for code paths that need to special-case these dtypes (PyTorch does not implement `isinf`/`isnan` for float8).
+- `--t5xxl-precision` flag for explicit precision control over the T5-XXL encoder in Flux models.
+
+### Changed
+
+- **Float8 tensors are never upsampled**: the default precision policy and explicit `--*-precision 16` both skip float8 tensors (keeping them as-is). Upsampling is only possible by passing `allow_upsampling=True` to `convert_tensor_to_16bit()` directly.
+- `validate_conversion()` skips post-conversion checks when either the source or target dtype is float8, as `torch.isinf` and `torch.isnan` are not implemented for those types.
+- `needs_16bit_conversion` detection now checks dtype directly (`float32`/`float64`) instead of comparing bit width, preventing float8 tensors from being mistakenly treated as candidates for downscaling.
+- Output precision suffix is now derived from the **actual dtypes present in the output dict** rather than from conversion bookkeeping. New possible suffixes: `fp8` (pure float8 output), `fp8_mixed` (float8 + 16-bit in the same file), `fp32` (no conversion performed, all fp32).
+- Extraction now prints `No precision conversion needed` when a component required no dtype changes.
+- **Flux architecture**: `clip` component renamed to `clip_l`; `t5` renamed to `t5xxl`. Patterns updated to match the `text_encoders.clip_l.*` and `text_encoders.t5xxl.*` key layout used by Flux checkpoints, in addition to flatter alternatives (`clip_l.*`, `t5xxl.*`).
+- `--t5xxl-precision` added to the component precision flag list in the CLI (alongside the existing `--t5-precision` for backward compatibility).
+
+
 ## [2.1] - Adaptive 16-bit conversion and post-conversion validation
 
 ### Added
