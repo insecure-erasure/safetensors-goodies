@@ -1159,12 +1159,15 @@ Unknown architectures are handled with generic pattern matching.
 
     # Precision options (now accept 16 or 32)
     for comp in ['vae', 'unet', 'transformer', 'dit', 'clip', 'clip_l', 'clip_g',
-                 't5', 't5xxl', 'text_encoder', 'text_encoder_2']:
+                 't5', 'text_encoder', 'text_encoder_2']:
+        help_text = f'Target precision for {comp} (16 or 32 bits)'
+        if comp == 't5':
+            help_text = 'Target precision for T5-XXL encoder (16 or 32 bits) (Flux, Chroma)'
         parser.add_argument(
             f'--{comp.replace("_", "-")}-precision',
             type=int,
             choices=[16, 32],
-            help=f'Target precision for {comp} (16 or 32 bits)'
+            help=help_text
         )
 
     args = parser.parse_args()
@@ -1196,13 +1199,16 @@ Unknown architectures are handled with generic pattern matching.
         return 1
 
     # Build precision map from args
+    # Note: the CLI exposes --t5-precision but the internal component name is 't5xxl';
+    # we remap here so the value reaches apply_precision_policy correctly.
     precision_map = {}
     for comp in ['vae', 'unet', 'transformer', 'dit', 'clip', 'clip_l', 'clip_g',
-                 't5', 't5xxl', 'text_encoder', 'text_encoder_2']:
+                 't5', 'text_encoder', 'text_encoder_2']:
         attr = f'{comp}_precision'
         val = getattr(args, attr, None)
         if val:
-            precision_map[comp] = val
+            internal_key = 't5xxl' if comp == 't5' else comp
+            precision_map[internal_key] = val
 
     try:
         extract_components(
