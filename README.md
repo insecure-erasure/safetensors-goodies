@@ -92,6 +92,15 @@ The following images were generated with SDXL using partially quantized CLIP-G t
 | in_proj FP8 | ![k7 qkv](assets/clip_g-k7-qkv_fp8.png) | ![k3 qkv](assets/clip_g-k3-qkv_fp8.png) | ![k1 qkv](assets/clip_g-k1-qkv_fp8.png) |
 | in_proj FP8<br>attn_out FP8 | ![k7 qkv+out](assets/clip_g-k7-qkv_fp8-out_fp8.png) | ![k3 qkv+out](assets/clip_g-k3-qkv_fp8-out_fp8.png) | ![k1 qkv+out](assets/clip_g-k1-qkv_fp8-out_fp8.png) |
 
+The chart below measures semantic fidelity using a CLIP-L (ViT-L/14) model loaded from a local checkpoint. Each image was encoded and compared against the positive prompt, the negative prompt, and the FP16 reference along three axes:
+
+- **Similarity · positive prompt**: all quantized variants score on par with the
+  reference, confirming that prompt alignment is preserved.
+- **Similarity · negative prompt**: a small but consistent upward drift is visible as quantization becomes more aggressive, particularly when `attn_out` is also quantized. Values remain low in absolute terms (~0.081–0.084).
+- **Semantic similarity · FP16 ref**: the least aggressive configuration (k=7, `in_proj` only) stays closest to the original (0.9953). All variants remain above 0.997, indicating no meaningful semantic degradation.
+
+![CLIP-L semantic similarity analysis](assets/clip_l-semantic-analysis.png)
+
 ## Requirements
 
 ```
