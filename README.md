@@ -8,7 +8,7 @@ A collection of command-line utilities for working with diffusion model files in
 
 Extracts individual components (UNet/Transformer/DiT, VAE, text encoders) from a full diffusion model checkpoint into separate `.safetensors` files, with automatic architecture detection and ComfyUI-compatible key renaming.
 
-The main use case is preparing components for independent quantization. The typical workflow is to extract the components with this script, convert them to GGUF format using the conversion tools bundled with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), and then quantize them with `llama-quantize` from [llama.cpp](https://github.com/ggerganov/llama.cpp) using [city96's diffusion model patch](https://github.com/city96/llama.cpp). This makes it possible to produce any K-quant variant (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, etc.) for any component of any supported architecture — something that checkpoint authors rarely provide beyond a handful of FP8 or INT4 releases.
+The main use case is preparing components for independent quantization. The typical workflow is to extract the components with this script, convert them to GGUF format using the conversion tools bundled with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), and then quantize them with `llama-quantize` from [llama.cpp](https://github.com/ggerganov/llama.cpp) using [city96's diffusion model patch](https://github.com/city96/ComfyUI-GGUF/blob/main/tools/README.md). This makes it possible to produce any K-quant variant (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, etc.) for any component of any supported architecture — something that checkpoint authors rarely provide beyond a handful of FP8 or INT4 releases.
 
 ### [quantize-clip_g.py](doc/quantize-clip_g.md)
 
