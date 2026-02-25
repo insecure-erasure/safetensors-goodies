@@ -93,6 +93,7 @@ FP8_ATTN_KV_SUFFIXES = {
 # Optional suffixes controlled by individual CLI flags
 FP8_ATTN_OUT_SUFFIX = "attn.out_proj.weight"  # --attn-out-fp8
 FP8_ATTN_Q_SUFFIX   = "attn.q_proj.weight"    # --attn-q-fp8
+FP8_IN_PROJ_SUFFIX  = "attn.in_proj_weight"   # --in-proj-fp8 (fused, no split)
 
 # Regex to detect a resblock key and extract block index + suffix
 # Matches: transformer.resblocks.{N}.{suffix}
@@ -136,7 +137,8 @@ def to_fp8(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def build_fp8_suffixes(split_attn: bool, keep_kv_fp16: bool,
-                       attn_out_fp8: bool, attn_q_fp8: bool) -> set:
+                       attn_out_fp8: bool, attn_q_fp8: bool,
+                       in_proj_fp8: bool) -> set:
     """
     Return the full set of weight suffixes to quantize to FP8 based on
     active flags.
@@ -146,6 +148,7 @@ def build_fp8_suffixes(split_attn: bool, keep_kv_fp16: bool,
       - K/V projections: when --split-attn-qkv is set and --keep-attn-kv-fp16 is not
       - Q projection:    when --split-attn-qkv and --attn-q-fp8 are both set
       - out_proj:        when --attn-out-fp8 is set (independent of split)
+      - in_proj_weight:  when --in-proj-fp8 is set and --split-attn-qkv is NOT set
     """
     suffixes = set(FP8_MLP_SUFFIXES)
     if split_attn and not keep_kv_fp16:
@@ -154,6 +157,10 @@ def build_fp8_suffixes(split_attn: bool, keep_kv_fp16: bool,
         suffixes.add(FP8_ATTN_Q_SUFFIX)
     if attn_out_fp8:
         suffixes.add(FP8_ATTN_OUT_SUFFIX)
+    # --in-proj-fp8 only applies when in_proj_weight is kept fused (no split)
+    # When --split-attn-qkv is active, Q/K/V are handled individually
+    if in_proj_fp8 and not split_attn:
+        suffixes.add(FP8_IN_PROJ_SUFFIX)
     return suffixes
 
 
@@ -603,13 +610,13 @@ def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
 
 def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
             split_attn: bool, keep_kv_fp16: bool, attn_q_fp8: bool, attn_out_fp8: bool,
-            verbose: bool):
+            in_proj_fp8: bool, verbose: bool):
     if not check_fp8_support():
         print("ERROR: float8_e4m3fn is not available in this PyTorch build.")
         print("       Requires PyTorch >= 2.1 compiled with FP8 support.")
         sys.exit(1)
 
-    fp8_suffixes = build_fp8_suffixes(split_attn, keep_kv_fp16, attn_out_fp8, attn_q_fp8)
+    fp8_suffixes = build_fp8_suffixes(split_attn, keep_kv_fp16, attn_out_fp8, attn_q_fp8, in_proj_fp8)
 
     print(f"Loading: {input_path}")
     sd_in = load_file(str(input_path))
@@ -618,10 +625,15 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
 
     if not split_attn:
         fp8_desc = "MLP weights"
+        if in_proj_fp8:
+            fp8_desc += " + attn.in_proj_weight (fused)"
         if attn_out_fp8:
             fp8_desc += " + attn out_proj"
         print(f"  FP8 candidates : blocks {first_keep}-{TOTAL_BLOCKS-2} ({fp8_desc})")
-        print(f"  in_proj_weight : kept fused in FP16 (use --split-attn-qkv to split)")
+        if in_proj_fp8:
+            print(f"  in_proj_weight : fused FP8 (--in-proj-fp8)")
+        else:
+            print(f"  in_proj_weight : kept fused in FP16 (use --split-attn-qkv to split)")
     else:
         fp8_desc = "MLP weights"
         if keep_kv_fp16:
@@ -665,10 +677,19 @@ def convert(input_path: Path, output_path: Path, first_keep: int, dry_run: bool,
         # ----------------------------------------------------------------
         if suffix == IN_PROJ_WEIGHT:
             if not split_attn:
-                # Default: keep the fused tensor intact at FP16
-                sd_out[key] = tensor.to(torch.float16)
-                log_tensor(key, tensor.dtype, torch.float16, verbose)
-                stats["fp16"] += 1
+                last_block = TOTAL_BLOCKS - 1
+                eligible = (block_idx >= first_keep) and (block_idx != last_block)
+                if in_proj_fp8 and eligible:
+                    # --in-proj-fp8: quantize fused tensor directly to FP8
+                    check_outliers(tensor, key, verbose)
+                    sd_out[key] = to_fp8(tensor)
+                    log_tensor(key, tensor.dtype, torch.float8_e4m3fn, verbose)
+                    stats["fp8"] += 1
+                else:
+                    # Default: keep the fused tensor intact at FP16
+                    sd_out[key] = tensor.to(torch.float16)
+                    log_tensor(key, tensor.dtype, torch.float16, verbose)
+                    stats["fp16"] += 1
                 continue
 
             # --split-attn-qkv: split Q/K/V and apply per-component strategy
@@ -883,6 +904,12 @@ def main():
              "Conservative extra savings with low quality risk. "
              "Does not require --split-attn-qkv (out_proj is already a separate tensor)."
     )
+    parser.add_argument(
+        "--in-proj-fp8", action="store_true",
+        help="Quantize attn.in_proj_weight to FP8 as a fused tensor (no split). "
+             "Incompatible with --split-attn-qkv. Check --analyze output for "
+             "attn.in_proj_weight QError before using this flag."
+    )
 
     # -- Output control --
     parser.add_argument(
@@ -937,9 +964,17 @@ def main():
         )
         sys.exit(1)
 
+    if args.in_proj_fp8 and args.split_attn_qkv:
+        print(
+            "ERROR: --in-proj-fp8 is incompatible with --split-attn-qkv. "
+            "When splitting, Q/K/V are handled individually.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
     convert(input_path, output_path, args.first_blocks_keep, args.dry_run,
             args.split_attn_qkv, args.keep_attn_kv_fp16, args.attn_q_fp8,
-            args.attn_out_fp8, args.verbose)
+            args.attn_out_fp8, args.in_proj_fp8, args.verbose)
 
 
 if __name__ == "__main__":

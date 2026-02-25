@@ -37,6 +37,7 @@ The following tensors in blocks `first_keep` through 30 are candidates for FP8 q
 | `mlp.c_fc.weight` | ✅ FP8 | — |
 | `mlp.c_proj.weight` | ✅ FP8 | — |
 | `attn.out_proj.weight` | FP16 | `--attn-out-fp8` |
+| `attn.in_proj_weight` *(fused)* | FP16 | `--in-proj-fp8` |
 | `attn.k_proj.weight` *(split)* | FP8 | `--split-attn-qkv` |
 | `attn.v_proj.weight` *(split)* | FP8 | `--split-attn-qkv` |
 | `attn.q_proj.weight` *(split)* | FP16 | `--split-attn-qkv --attn-q-fp8` |
@@ -44,6 +45,8 @@ The following tensors in blocks `first_keep` through 30 are candidates for FP8 q
 ### Fused attention weights (`in_proj_weight`)
 
 The original OpenCLIP format stores Q, K, and V projections as a single fused tensor (`attn.in_proj_weight`). By default the script leaves this tensor intact at FP16.
+
+With `--in-proj-fp8`, the fused tensor is quantized to FP8 directly, without splitting. This is the lower-risk alternative to `--split-attn-qkv` when the goal is simply to reduce the memory footprint of the attention input projection. Check the `attn.in_proj_weight` QError in `--analyze` output before using this flag. **Incompatible with `--split-attn-qkv`.**
 
 With `--split-attn-qkv`, the fused tensor is split into three separate tensors (`attn.q_proj.weight`, `attn.k_proj.weight`, `attn.v_proj.weight`) and the corresponding bias is split into `attn.q_proj.bias`, `attn.k_proj.bias`, `attn.v_proj.bias`. Splitting replaces 2 tensors (weight + bias) with 6, for a net gain of +4 tensors per eligible block.
 
@@ -129,6 +132,7 @@ python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
 | `--keep-attn-kv-fp16` | | off | When splitting, keep K and V at FP16 instead of quantizing them. Requires `--split-attn-qkv`. |
 | `--attn-q-fp8` | | off | Quantize the Q projection to FP8 in intermediate blocks. Requires `--split-attn-qkv`. |
 | `--attn-out-fp8` | | off | Quantize `out_proj.weight` to FP8 in intermediate blocks. Does not require `--split-attn-qkv`. |
+| `--in-proj-fp8` | | off | Quantize `attn.in_proj_weight` to FP8 as a fused tensor (no split). Incompatible with `--split-attn-qkv`. Check `--analyze` output for `attn.in_proj_weight` QError before using. |
 | `--dry-run` | | off | Compute and print statistics without writing the output file. |
 | `--verbose` | `-v` | off | Print per-tensor dtype mapping and detailed outlier information. |
 

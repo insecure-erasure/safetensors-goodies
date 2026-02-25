@@ -7,6 +7,17 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [1.1.2] - Add --in-proj-fp8 flag to quantize-clip_g.py
+
+### Changed (`quantize-clip_g.py`)
+
+- **`--in-proj-fp8`**: quantizes `attn.in_proj_weight` to FP8 as a fused tensor, without splitting into Q/K/V. Applies only to intermediate blocks (respects `--first-blocks-keep` and the always-protected last block). Incompatible with `--split-attn-qkv`; an explicit error is raised if both flags are passed together.
+- `FP8_IN_PROJ_SUFFIX` constant for the fused `attn.in_proj_weight` suffix.
+- `build_fp8_suffixes()` now accepts `in_proj_fp8` parameter; adds `FP8_IN_PROJ_SUFFIX` to the candidate set when `--in-proj-fp8` is active and `--split-attn-qkv` is not.
+- Startup summary now reports `in_proj_weight : fused FP8 (--in-proj-fp8)` when the flag is active, instead of the default FP16 notice.
+
+---
+
 ## [1.1.1] - Richer analyze mode output for quantize-clip_g.py
 
 ### Changed (`quantize-clip_g.py`)
