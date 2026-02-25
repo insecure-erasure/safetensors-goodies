@@ -7,6 +7,25 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [1.1.1] - Richer analyze mode output for quantize-clip_g.py
+
+### Changed (`quantize-clip_g.py`)
+
+- Component names in the per-block analysis table now use dot-notation consistent with the tensor key names (`MLP.c_fc`, `MLP.c_proj`, `attn.out_proj`, `attn.in_proj_weight`, `attn.q_proj.weight`, `attn.k_proj.weight`, `attn.v_proj.weight`) instead of the previous informal labels (`MLP c_fc`, `attn Q`, `in_proj (fused)`, etc.).
+- Q/K/V rows in the analysis table are now rendered indented under `attn.in_proj_weight` using a tree-style layout (`├─` / `└─`).
+- Analysis table column width increased to accommodate the longer component names.
+
+### Added (`quantize-clip_g.py`)
+
+- **`--attn-out-fp8` impact analysis** section in `--analyze` mode: reports per-block quantization error for `attn.out_proj.weight` across all intermediate blocks, classifies risk (ok / ELEVATED ≥8% / HIGH ≥12%), and recommends the minimum `--first-blocks-keep` value needed to safely use `--attn-out-fp8`. Cross-references with the general block sensitivity recommendation.
+- **`--split-attn-qkv` K/V impact analysis** section in `--analyze` mode: reports per-block quantization error for K and V projections (derived from `in_proj_weight`) across all intermediate blocks, flags blocks with QError ≥ 6% as elevated, and recommends `--first-blocks-keep` or `--keep-attn-kv-fp16` as mitigations.
+- `COMPONENT_DISPLAY_NAMES` and `IN_PROJ_CHILD_NAMES` dicts: centralize component display name mapping used in the analysis output.
+- `WARN_THRESHOLD_OUT_PROJ` (0.08) and `WARN_THRESHOLD_HIGH` (0.12) constants for `--attn-out-fp8` risk classification.
+- `block_raw` dict in `analyze()`: parallel per-block storage keyed by raw suffix, used by the flag-specific analysis helpers.
+- `_analyze_attn_out_fp8()` and `_analyze_attn_kv_fp8()` as standalone helper functions called at the end of `analyze()`.
+
+---
+
 ## [1.1.0] - Initial release of quantize-clip_g.py
 
 ### Added

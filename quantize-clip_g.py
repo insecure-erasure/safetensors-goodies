@@ -33,28 +33,28 @@ Requirements:
 
 Usage:
     # Conservative: only MLP weights quantized to FP8
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors
 
     # Split attention and quantize K/V to FP8
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv
 
     # Split attention but keep K/V at FP16 (diagnostic: isolate split vs quantization)
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --keep-attn-kv-fp16
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --keep-attn-kv-fp16
 
     # Also quantize out_proj (independent of split)
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --attn-out-fp8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --attn-out-fp8
 
     # Maximum quantization: split + all attention weights to FP8
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --attn-q-fp8 --attn-out-fp8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --attn-q-fp8 --attn-out-fp8
 
     # Dry run with verbose per-tensor mapping
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --dry-run --verbose
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --split-attn-qkv --dry-run --verbose
 
     # Adjust number of preserved initial blocks
-    python quantize-clip_g .py -i clip_g.safetensors -o clip_g_fp8.safetensors --first-blocks-keep 8
+    python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors --first-blocks-keep 8
 
     # Analyze tensors to identify sensitive blocks before quantizing
-    python quantize-clip_g .py -i clip_g.safetensors --analyze
+    python quantize-clip_g.py -i clip_g.safetensors --analyze
 """
 
 import argparse
@@ -205,6 +205,24 @@ ANALYSIS_WEIGHT_SUFFIXES = {
     "attn.out_proj.weight",
 }
 
+# Friendly display names for components
+COMPONENT_DISPLAY_NAMES = {
+    "mlp.c_fc.weight":       "MLP.c_fc",
+    "mlp.c_proj.weight":     "MLP.c_proj",
+    "attn.out_proj.weight":  "attn.out_proj",
+}
+
+# Display names for the in_proj children (shown indented under attn.in_proj_weight)
+IN_PROJ_CHILD_NAMES = {
+    "attn.q_proj.weight": "attn.q_proj",
+    "attn.k_proj.weight": "attn.k_proj",
+    "attn.v_proj.weight": "attn.v_proj",
+}
+
+# QError thresholds for per-component warnings (as fractions, not percentages)
+WARN_THRESHOLD_OUT_PROJ = 0.08   # 8%: elevated risk for out_proj
+WARN_THRESHOLD_HIGH     = 0.12   # 12%: high risk, strongly discouraged
+
 
 def analyze_tensor(tensor: torch.Tensor):
     """
@@ -261,7 +279,9 @@ def analyze(input_path: Path):
 
     # Collect per-block, per-component metrics
     # Structure: block_data[block_idx][component_name] = metrics dict
-    block_data = {}
+    block_data    = {}
+    # Also keep a raw-suffix -> metrics mapping for flag-specific analysis
+    block_raw     = {}   # block_raw[block_idx][suffix] = metrics dict
 
     for key, tensor in sd.items():
         m = RESBLOCK_RE.match(key)
@@ -276,34 +296,41 @@ def analyze(input_path: Path):
 
         if block_idx not in block_data:
             block_data[block_idx] = {}
+            block_raw[block_idx]  = {}
 
         if suffix == IN_PROJ_WEIGHT:
             # Analyze the fused tensor as a whole
-            block_data[block_idx]["in_proj (fused)"] = analyze_tensor(tensor)
+            block_data[block_idx]["attn.in_proj_weight"] = analyze_tensor(tensor)
             # Also analyze Q/K/V components separately
             q, k, v = split_in_proj(tensor)
-            block_data[block_idx]["attn Q"] = analyze_tensor(q)
-            block_data[block_idx]["attn K"] = analyze_tensor(k)
-            block_data[block_idx]["attn V"] = analyze_tensor(v)
+            block_data[block_idx]["attn.q_proj.weight"] = analyze_tensor(q)
+            block_data[block_idx]["attn.k_proj.weight"] = analyze_tensor(k)
+            block_data[block_idx]["attn.v_proj.weight"] = analyze_tensor(v)
+            block_raw[block_idx]["attn.q_proj.weight"] = block_data[block_idx]["attn.q_proj.weight"]
+            block_raw[block_idx]["attn.k_proj.weight"] = block_data[block_idx]["attn.k_proj.weight"]
+            block_raw[block_idx]["attn.v_proj.weight"] = block_data[block_idx]["attn.v_proj.weight"]
         else:
-            # Friendly name for display
-            name_map = {
-                "mlp.c_fc.weight":       "MLP c_fc",
-                "mlp.c_proj.weight":     "MLP c_proj",
-                "attn.out_proj.weight":  "attn out_proj",
-            }
-            name = name_map.get(suffix, suffix)
-            block_data[block_idx][name] = analyze_tensor(tensor)
+            name = COMPONENT_DISPLAY_NAMES.get(suffix, suffix)
+            metrics = analyze_tensor(tensor)
+            block_data[block_idx][name] = metrics
+            block_raw[block_idx][suffix] = metrics
 
     if not block_data:
         print("No resblock weight tensors found in the file.")
         return
 
     # --- Per-block detailed report ---
-    print("=" * 90)
-    print(f"{'Block':>5} {'Component':<18} {'Params':>10} {'Norm':>10} "
+    # Column widths: component column needs extra space for indented children
+    COL_COMP = 22
+    print("=" * 94)
+    print(f"{'Block':>5} {'Component':<{COL_COMP}} {'Params':>10} {'Norm':>10} "
           f"{'Max|W|':>10} {'Std':>10} {'Outliers':>10} {'QError%':>10}")
-    print("-" * 90)
+    print("-" * 94)
+
+    # Ordered rendering: attn.in_proj_weight first, then its children, then the rest
+    IN_PROJ_KEY  = "attn.in_proj_weight"
+    IN_PROJ_CHILDREN = ["attn.q_proj.weight", "attn.k_proj.weight", "attn.v_proj.weight"]
+    RENDER_ORDER = [IN_PROJ_KEY] + IN_PROJ_CHILDREN + ["attn.out_proj", "MLP.c_fc", "MLP.c_proj"]
 
     # Collect per-block aggregate quantization error for ranking
     block_agg_error = {}
@@ -313,27 +340,56 @@ def analyze(input_path: Path):
         weighted_error_sum = 0.0
         total_params = 0
 
-        for comp_name, m in components.items():
+        for comp_key, m in components.items():
             # Skip the fused in_proj from the aggregate since we already
             # count Q/K/V separately
-            if comp_name == "in_proj (fused)":
+            if comp_key == IN_PROJ_KEY:
                 continue
             weighted_error_sum += m["quant_error"] * m["params"]
             total_params += m["params"]
 
         block_agg_error[block_idx] = weighted_error_sum / total_params if total_params > 0 else 0.0
 
-        for comp_name, m in components.items():
-            outlier_str = f"{m['outliers']}" if m["outliers"] == 0 else f"{m['outliers']} ({m['outlier_pct']:.3f}%)"
-            print(f"{block_idx:>5} {comp_name:<18} {m['params']:>10,} {m['norm']:>10.2f} "
+        # Build ordered list of (display_name, metrics, is_child)
+        rows = []
+        for comp_key, m in components.items():
+            if comp_key == IN_PROJ_KEY:
+                rows.append(("attn.in_proj_weight", m, False, True))  # (name, metrics, is_child, is_parent)
+            elif comp_key in IN_PROJ_CHILDREN:
+                display = IN_PROJ_CHILD_NAMES[comp_key]
+                rows.append((display, m, True, False))
+            else:
+                rows.append((comp_key, m, False, False))
+
+        # Sort by a canonical order
+        order_map = {
+            "attn.in_proj_weight": 0,
+            "attn.q_proj": 1, "attn.k_proj": 2, "attn.v_proj": 3,
+            "attn.out_proj": 4, "MLP.c_fc": 5, "MLP.c_proj": 6,
+        }
+        rows.sort(key=lambda r: order_map.get(r[0], 99))
+
+        for i, (disp_name, m, is_child, is_parent) in enumerate(rows):
+            outlier_str = (f"{m['outliers']}" if m["outliers"] == 0
+                           else f"{m['outliers']} ({m['outlier_pct']:.3f}%)")
+            if is_child:
+                # Determine tree character: last child gets └─, others get ├─
+                child_rows = [r for r in rows if r[2]]  # all children
+                is_last = (disp_name == child_rows[-1][0])
+                tree = "  └─ " if is_last else "  ├─ "
+                comp_col = f"{tree}{disp_name}"
+            else:
+                comp_col = disp_name
+
+            print(f"{block_idx:>5} {comp_col:<{COL_COMP}} {m['params']:>10,} {m['norm']:>10.2f} "
                   f"{m['max_abs']:>10.4f} {m['std']:>10.6f} {outlier_str:>10} "
                   f"{m['quant_error']*100:>9.4f}%")
         print()
 
     # --- Block ranking by quantization sensitivity ---
-    print("=" * 90)
+    print("=" * 94)
     print("Block sensitivity ranking (weighted average quantization error, higher = more sensitive)")
-    print("-" * 90)
+    print("-" * 94)
 
     ranked = sorted(block_agg_error.items(), key=lambda x: x[1], reverse=True)
 
@@ -358,7 +414,7 @@ def analyze(input_path: Path):
     print(f"  Sensitivity threshold   : {threshold*100:.4f}% (mean + 1 std)")
     print()
 
-    # --- Recommendation ---
+    # --- General recommendation ---
     if sensitive_blocks:
         sensitive_blocks.sort()
         block_list = ", ".join(str(b) for b in sensitive_blocks)
@@ -388,6 +444,156 @@ def analyze(input_path: Path):
         print("  No blocks show significantly elevated quantization error.")
         print("  The default --first-blocks-keep value should be adequate.")
 
+    print()
+
+    # --- --attn-out-fp8 impact analysis ---
+    _analyze_attn_out_fp8(block_raw, sensitive_blocks)
+
+    # --- --split-attn-qkv + K/V impact analysis ---
+    _analyze_attn_kv_fp8(block_raw, sensitive_blocks)
+
+    print()
+
+
+def _analyze_attn_out_fp8(block_raw: dict, sensitive_blocks: list):
+    """
+    Report the per-block impact of enabling --attn-out-fp8, highlighting
+    blocks where out_proj quantization error is elevated or high.
+    """
+    last_block = TOTAL_BLOCKS - 1
+
+    # Collect out_proj errors for all intermediate blocks
+    out_proj_errors = {}
+    for block_idx in sorted(block_raw.keys()):
+        if block_idx == last_block:
+            continue
+        suffix_data = block_raw[block_idx]
+        if "attn.out_proj.weight" in suffix_data:
+            out_proj_errors[block_idx] = suffix_data["attn.out_proj.weight"]["quant_error"]
+
+    if not out_proj_errors:
+        return
+
+    elevated = {b: e for b, e in out_proj_errors.items() if e >= WARN_THRESHOLD_OUT_PROJ}
+    high     = {b: e for b, e in out_proj_errors.items() if e >= WARN_THRESHOLD_HIGH}
+
+    print("  --attn-out-fp8 impact analysis")
+    print("  " + "-" * 60)
+
+    if not elevated:
+        print("  All intermediate blocks show acceptable out_proj QError (<8%).")
+        print("  --attn-out-fp8 is safe to use with any --first-blocks-keep value.")
+        print()
+        return
+
+    # Show per-block out_proj error table for intermediate blocks
+    print(f"  {'Block':>5}  {'out_proj QError%':>16}  {'Risk':>12}  {'Note'}")
+    print(f"  {'-'*5}  {'-'*16}  {'-'*12}  {'-'*30}")
+    for block_idx in sorted(out_proj_errors.keys()):
+        err = out_proj_errors[block_idx]
+        pct = err * 100
+        if err >= WARN_THRESHOLD_HIGH:
+            risk = "HIGH"
+            note = "strongly discouraged"
+        elif err >= WARN_THRESHOLD_OUT_PROJ:
+            risk = "ELEVATED"
+            note = "review carefully"
+        else:
+            risk = "ok"
+            note = ""
+        marker = " <<" if err >= WARN_THRESHOLD_OUT_PROJ else ""
+        print(f"  {block_idx:>5}  {pct:>15.4f}%  {risk:>12}  {note}{marker}")
+
+    print()
+
+    # Determine which elevated blocks would be exposed for different keep values
+    # Find the minimum --first-blocks-keep that covers all high-risk out_proj blocks
+    high_blocks   = sorted(high.keys())
+    elev_blocks   = sorted(elevated.keys())
+
+    if high_blocks:
+        min_keep_high = max(high_blocks) + 1
+        print(f"  WARNING: {len(high_blocks)} block(s) with out_proj QError ≥ 12%: "
+              f"{', '.join(str(b) for b in high_blocks)}")
+        print(f"           --attn-out-fp8 is strongly discouraged unless "
+              f"--first-blocks-keep >= {min_keep_high}.")
+
+    if elev_blocks:
+        min_keep_elev = max(elev_blocks) + 1
+        print(f"  CAUTION:  {len(elev_blocks)} block(s) with out_proj QError ≥ 8%: "
+              f"{', '.join(str(b) for b in elev_blocks)}")
+        print(f"           To safely use --attn-out-fp8, set --first-blocks-keep >= {min_keep_elev}.")
+
+    # Cross-reference with general --first-blocks-keep recommendation
+    if sensitive_blocks:
+        suggested_keep = max(sensitive_blocks) + 1 if sensitive_blocks[-1] < TOTAL_BLOCKS - 1 else TOTAL_BLOCKS - 2
+        contiguous_keep = 0
+        for i, b in enumerate(sensitive_blocks):
+            if b == i:
+                contiguous_keep = i + 1
+            else:
+                break
+
+        effective_keep = contiguous_keep if contiguous_keep > 0 else suggested_keep
+        remaining_elev = [b for b in elev_blocks if b >= effective_keep]
+        if remaining_elev:
+            print(f"  With the suggested --first-blocks-keep {effective_keep}, blocks "
+                  f"{', '.join(str(b) for b in remaining_elev)} would still be exposed "
+                  f"to out_proj quantization.")
+            print(f"  Consider omitting --attn-out-fp8 or raising --first-blocks-keep "
+                  f"to {max(remaining_elev) + 1}.")
+
+    print()
+
+
+def _analyze_attn_kv_fp8(block_raw: dict, sensitive_blocks: list):
+    """
+    Report the per-block impact of enabling --split-attn-qkv with K/V quantization,
+    highlighting blocks where K or V projection quantization error is elevated.
+    """
+    last_block = TOTAL_BLOCKS - 1
+
+    WARN_KV = 0.06  # 6%: K/V are somewhat more sensitive than MLP
+
+    kv_errors = {}
+    for block_idx in sorted(block_raw.keys()):
+        if block_idx == last_block:
+            continue
+        suffix_data = block_raw[block_idx]
+        k_err = suffix_data.get("attn.k_proj.weight", {}).get("quant_error")
+        v_err = suffix_data.get("attn.v_proj.weight", {}).get("quant_error")
+        if k_err is not None and v_err is not None:
+            kv_errors[block_idx] = {"k": k_err, "v": v_err, "max": max(k_err, v_err)}
+
+    if not kv_errors:
+        return
+
+    elevated_kv = {b: d for b, d in kv_errors.items() if d["max"] >= WARN_KV}
+
+    print("  --split-attn-qkv K/V quantization impact analysis")
+    print("  " + "-" * 60)
+
+    if not elevated_kv:
+        print("  All intermediate blocks show acceptable K/V QError (<6%).")
+        print("  --split-attn-qkv with K/V FP8 is safe across intermediate blocks.")
+        print()
+        return
+
+    print(f"  {'Block':>5}  {'K QError%':>10}  {'V QError%':>10}  {'Risk':>10}")
+    print(f"  {'-'*5}  {'-'*10}  {'-'*10}  {'-'*10}")
+    for block_idx in sorted(kv_errors.keys()):
+        d = kv_errors[block_idx]
+        risk = "ELEVATED" if d["max"] >= WARN_KV else "ok"
+        marker = " <<" if d["max"] >= WARN_KV else ""
+        print(f"  {block_idx:>5}  {d['k']*100:>9.4f}%  {d['v']*100:>9.4f}%  {risk:>10}{marker}")
+
+    print()
+    elev_blocks    = sorted(elevated_kv.keys())
+    min_keep_kv    = max(elev_blocks) + 1
+    print(f"  CAUTION: {len(elev_blocks)} block(s) with elevated K/V QError (≥6%): "
+          f"{', '.join(str(b) for b in elev_blocks)}")
+    print(f"           To safely use K/V FP8, set --first-blocks-keep >= {min_keep_kv},")
+    print(f"           or use --keep-attn-kv-fp16 to keep K/V at FP16 after the split.")
     print()
 
 

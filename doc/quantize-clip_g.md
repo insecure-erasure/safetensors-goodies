@@ -149,7 +149,25 @@ python quantize-clip_g.py -i clip_g.safetensors -o clip_g_fp8.safetensors \
 
 Blocks are ranked by their **weighted average quantization error** (across all quantizable tensors). Blocks with error above mean + 1 standard deviation are flagged as sensitive, and the script emits a recommendation for `--first-blocks-keep`.
 
-The fused `in_proj_weight` is analyzed both as a whole and split into Q, K, V components.
+The fused `in_proj_weight` is analyzed both as a whole and split into Q, K, V components. The Q/K/V rows are rendered indented under `attn.in_proj_weight` using a tree-style layout (`├─` / `└─`).
+
+After the general block ranking, the analysis mode emits two additional sections:
+
+### --attn-out-fp8 impact analysis
+
+Reports per-block quantization error for `attn.out_proj.weight` across all intermediate blocks, with risk classification:
+
+| Threshold | Risk level | Meaning |
+|---|---|---|
+| QError < 8% | ok | Safe to quantize |
+| QError ≥ 8% | ELEVATED | Review carefully |
+| QError ≥ 12% | HIGH | Strongly discouraged |
+
+For blocks with elevated or high risk, the section reports the minimum `--first-blocks-keep` value needed to exclude them from quantization, and cross-references it with the general block sensitivity recommendation.
+
+### --split-attn-qkv K/V quantization impact analysis
+
+Reports per-block quantization error for `attn.k_proj.weight` and `attn.v_proj.weight` (derived from splitting `in_proj_weight`) across all intermediate blocks. Blocks where either K or V exceeds 6% QError are flagged as elevated. The section recommends the minimum `--first-blocks-keep` to cover them, or suggests using `--keep-attn-kv-fp16` as an alternative.
 
 ---
 
