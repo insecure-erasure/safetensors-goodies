@@ -7,6 +7,21 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.6] - T5 precision flag consolidation
+
+### Changed
+
+- `--t5-precision` is now the single canonical flag for controlling T5-XXL encoder
+  precision. `--t5xxl-precision` has been removed.
+- Internally, the CLI value is remapped to the `t5xxl` component key when building
+  the precision map, so the override reaches `apply_precision_policy` correctly.
+
+### Fixed
+
+- `--t5-precision` was inert since v2.2: it wrote to `precision_map['t5']` but no
+  extracted component carries that name (the component was renamed to `t5xxl` in
+  v2.2). The flag is now functional.
+
 ## [2.5] - Chroma distilled model support
 
 ### Fixed
