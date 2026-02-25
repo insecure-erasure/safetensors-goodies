@@ -295,6 +295,7 @@ ARCHITECTURE_PATTERNS = {
                     r'^vector_in\.',
                     r'^guidance_in\.',
                     r'^final_layer\.',
+                    r'^distilled_guidance_layer\.',  # Chroma distilled models
                 ],
                 'key_transforms': [
                     ('model.diffusion_model.', ''),

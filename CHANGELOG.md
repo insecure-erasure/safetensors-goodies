@@ -7,6 +7,13 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.5] - Chroma distilled model support
+
+### Fixed
+
+- Flux `transformer` component now recognises `distilled_guidance_layer.*` keys, present in Chroma distilled model variants. Without this pattern those keys were left unclassified and dropped from the extracted file.
+
+
 ## [2.4] - Richer analyze mode output
 
 ### Changed

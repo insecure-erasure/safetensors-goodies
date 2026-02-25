@@ -17,7 +17,7 @@ A command-line utility to extract individual components from diffusion model che
 |---|---|---|---|
 | SDXL / Pony | UNet | ✓ | CLIP-L + CLIP-G |
 | SD 1.5 / 2.x | UNet | ✓ | CLIP |
-| Flux | Transformer | ✓ | CLIP-L + T5-XXL |
+| Flux / Chroma | Transformer | ✓ | CLIP-L + T5-XXL |
 | Lumina / zImage | DiT | ✓ | Text encoder |
 | PixArt | DiT | ✓ | Text encoder |
 | HunyuanDiT | DiT | ✓ | Text encoder + Text encoder 2 |
