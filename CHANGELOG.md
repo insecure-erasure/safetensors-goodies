@@ -7,6 +7,15 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
+## [2.4] - Richer analyze mode output
+
+### Changed
+
+- `--analyze` now displays **checkpoint metadata** at the top of the output (before the component breakdown), with individual values truncated to 200 characters. Previously metadata was shown as a single count at the bottom.
+- Each component in the breakdown now includes a **dtype distribution summary** (e.g. `312 fp16, 4 fp32`), derived by reading tensor metadata via `safe_open` without loading weights into memory. Float8 variants are shown with their full type name (`fp8_e4m3fn`, `fp8_e5m2`).
+- Sample key display increased from 3 to 10 keys per component.
+
+
 ## [2.3] - Flux key transform fixes for nested transformer prefix
 
 ### Fixed

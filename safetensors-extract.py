@@ -810,35 +810,74 @@ def analyze_checkpoint(input_path):
         print(f"Wrapper prefix: '{wrapper_prefix}'")
     print("=" * 70)
 
-    # Classify all tensors
+    # Show metadata first
+    if metadata:
+        print(f"\nMetadata ({len(metadata)} entries):")
+        for key, value in sorted(metadata.items()):
+            # Truncate very long values
+            value_str = str(value)
+            if len(value_str) > 200:
+                value_str = value_str[:197] + "..."
+            print(f"  {key}: {value_str}")
+
+    # Classify all tensors and collect dtype information
     components = defaultdict(list)
-    for key in keys:
-        if architecture != 'Unknown':
-            comp, stripped = classify_tensor_by_architecture(key, architecture, wrapper_prefix)
-        else:
-            comp, stripped = classify_tensor_generic(key, wrapper_prefix)
+    component_dtypes = defaultdict(lambda: defaultdict(int))
 
-        if comp is None:
-            comp, _ = classify_tensor_generic(key, wrapper_prefix)
+    with safe_open(input_path, framework="pt", device="cpu") as f:
+        for key in keys:
+            if architecture != 'Unknown':
+                comp, stripped = classify_tensor_by_architecture(key, architecture, wrapper_prefix)
+            else:
+                comp, stripped = classify_tensor_generic(key, wrapper_prefix)
 
-        components[comp or 'unknown'].append(key)
+            if comp is None:
+                comp, _ = classify_tensor_generic(key, wrapper_prefix)
+
+            comp = comp or 'unknown'
+            components[comp].append(key)
+
+            # Get dtype of this tensor
+            tensor_meta = f.get_tensor(key)
+            dtype = tensor_meta.dtype
+
+            # Convert dtype to readable name
+            dtype_name = str(dtype).replace('torch.', '')
+            component_dtypes[comp][dtype_name] += 1
 
     print("\nComponent breakdown:")
     for comp, comp_keys in sorted(components.items()):
-        print(f"\n  {comp}: {len(comp_keys)} tensors")
+        # Build dtype statistics string
+        dtype_counts = component_dtypes[comp]
+        dtype_parts = []
+        for dtype, count in sorted(dtype_counts.items()):
+            # Simplify dtype names
+            if dtype == 'float16':
+                dtype_parts.append(f"{count} fp16")
+            elif dtype == 'bfloat16':
+                dtype_parts.append(f"{count} bf16")
+            elif dtype == 'float32':
+                dtype_parts.append(f"{count} fp32")
+            elif dtype == 'float8_e4m3fn':
+                dtype_parts.append(f"{count} fp8_e4m3fn")
+            elif dtype == 'float8_e5m2':
+                dtype_parts.append(f"{count} fp8_e5m2")
+            else:
+                dtype_parts.append(f"{count} {dtype}")
+
+        dtype_str = ", ".join(dtype_parts)
+        print(f"\n  {comp}: {len(comp_keys)} tensors ({dtype_str})")
+
         # Show sample keys
-        for k in comp_keys[:3]:
+        for k in comp_keys[:10]:
             transformed = transform_key(k, comp, architecture)
             if k != transformed:
                 print(f"    {k}")
                 print(f"      → {transformed}")
             else:
                 print(f"    {k}")
-        if len(comp_keys) > 3:
-            print(f"    ... and {len(comp_keys) - 3} more")
-
-    if metadata:
-        print(f"\nMetadata: {len(metadata)} entries")
+        if len(comp_keys) > 10:
+            print(f"    ... and {len(comp_keys) - 10} more")
 
     return architecture, confidence, wrapper_prefix, components
 
