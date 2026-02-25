@@ -27,13 +27,9 @@ All three images were generated using the same prompt, seed, and sampler setting
 |:---:|:---:|:---:|
 | <small>**Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Reference output.</small> | <small>**GGUF FP16 + VAE extracted from checkpoint**<br>UNet in GGUF FP16, VAE and CLIP extracted from the same checkpoint in FP16. Pixel-perfect identical to the reference.</small> | <small>**GGUF FP16 + [madebyollin VAE fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) — FP16**<br>Same as above but with madebyollin's VAE (originally FP32, converted to FP16).</small> |
 
-| Q8_0 | Q6_K | Q5_K_S |
+| ![Q8_0](/assets/Q8_0.png) | ![Q6_K](/assets/Q6_K.png) | ![Q4_K_M](/assets/Q4_K_M.png) |
 |:---:|:---:|:---:|
-| ![Q8_0](/assets/Q8_0.png) | ![Q6_K](/assets/Q6_K.png) | ![Q5_K_S](/assets/Q5_K_S.png) |
-
-| Q4_K_M | Q3_K_M | Q2_K |
-|:---:|:---:|:---:|
-| ![Q4_K_M](/assets/Q4_K_M.png) | ![Q3_K_M](/assets/Q3_K_M.png) | ![Q2_K](/assets/Q2_K.png) |
+| Q8_0 | Q6_K | Q4_K_M |
 
 ## [quantize-clip_g.py](doc/quantize-clip_g.md)
 
