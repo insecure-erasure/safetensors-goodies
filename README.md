@@ -27,6 +27,51 @@ All three images were generated using the same prompt, seed, and sampler setting
 |:---:|:---:|:---:|
 | <small>**Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Reference output.</small> | <small>**GGUF FP16 + VAE extracted from checkpoint**<br>UNet in GGUF FP16, VAE and CLIP extracted from the same checkpoint in FP16. Pixel-perfect identical to the reference.</small> | <small>**GGUF FP16 + [madebyollin VAE fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) — FP16**<br>Same as above but with madebyollin's VAE (originally FP32, converted to FP16).</small> |
 
+### Generating Quantized UNets in GGUF Format
+
+The starting point is the original checkpoint in `.safetensors` format. The first step is extracting its components using the `safetensors-extract.py` script:
+```bash
+$ safetensors-extract.py -i cyberrealisticXL_v90.safetensors -d
+```
+
+This generates the following files (all in FP16 in this case):
+```
+cyberrealisticXL_v90_unet.safetensors
+cyberrealisticXL_v90_clip_l.safetensors
+cyberrealisticXL_v90_clip_g.safetensors
+cyberrealisticXL_v90_vae.safetensors
+```
+
+The extracted UNet is then converted to F16 GGUF using the `convert.py` script bundled with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF):
+```bash
+$ <path_to_comfyui>/custom_nodes/ComfyUI-GGUF/tools/convert.py \
+    --src cyberrealisticXL_v90_unet.safetensors \
+    --dst cyberrealisticXL_v90.gguf
+```
+
+With the F16 GGUF as a base, the various quantizations can be generated using `llama-quantize`, which is obtained by compiling `llama.cpp` with city96's patch as described in the [official documentation](https://github.com/city96/ComfyUI-GGUF/blob/main/tools/README.md):
+```bash
+$ llama-quantize cyberrealisticXL_v90.gguf cyberrealisticXL_v90-Q8_0.gguf Q8_0
+```
+
+The process is identical for the remaining quantizations, only varying the output filename and the quantization type.
+
+The following table summarizes the file size on disk for each quantization level, using the F16 GGUF as reference, to help you choose one based on your available storage and memory.
+
+| Quantization | File Size |
+|:---:|:---:|
+| F16 | 4.8 GB |
+| Q8_0 | 2.6 GB |
+| Q6_K | 2.0 GB |
+| Q5_K_S | 1.7 GB |
+| Q4_K_M | 1.6 GB |
+| Q3_K_M | 1.2 GB |
+| Q2_K | 845 MB |
+
+Once the quantized GGUF files are generated, they can be loaded directly into ComfyUI using the **GGUF Loader** node included in [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), with no additional steps required.
+
+The following table shows the difference between some of the K-quants available with `llama-quantize`.
+
 | ![Q8_0](/assets/Q8_0.png) | ![Q6_K](/assets/Q6_K.png) | ![Q4_K_M](/assets/Q4_K_M.png) |
 |:---:|:---:|:---:|
 | Q8_0 | Q6_K | Q4_K_M |
