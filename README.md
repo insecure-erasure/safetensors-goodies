@@ -15,19 +15,17 @@ This section validates that different SDXL pipeline configurations produce equiv
 
 All three images were generated using the same prompt, seed, and sampler settings.
 
-* Checkpoint: [cyberrealisticXL v9.0](https://civitai.com/models/312530?modelVersionId=2611295) by [Cyberdelia](https://civitai.com/user/Cyberdelia)
-* Prompt: ultra detailed bust portrait of a 28-year-old woman, medium shot, wearing turtle neck sweater, subject centered, natural framing, 50mm lens, realistic skin texture, detailed eyes, soft cinematic lighting, professional photography, high dynamic range, sharp focus, natural colors
-* Negative prompt: lowres, blurry, oversharpened, jpeg artifacts, bad anatomy, extra fingers, deformed hands, cross-eye, plastic skin, overexposed, underexposed, watermark, text, logo
-* Sampler: dpmpp_2m
-* Scheduler: karras
-* Steps: 30
-* Denoise: 1.0
+* **Checkpoint:** [cyberrealisticXL v9.0](https://civitai.com/models/312530?modelVersionId=2611295) by [Cyberdelia](https://civitai.com/user/Cyberdelia)
+* **Prompt:** *ultra detailed bust portrait of a 28-year-old woman, medium shot, wearing turtle neck sweater, subject centered, natural framing, 50mm lens, realistic skin texture, detailed eyes, soft cinematic lighting, professional photography, high dynamic range, sharp focus, natural colors*
+* **Negative prompt:** *lowres, blurry, oversharpened, jpeg artifacts, bad anatomy, extra fingers, deformed hands, cross-eye, plastic skin, overexposed, underexposed, watermark, text, logo*
+* **Sampler:** dpmpp_2m
+* **Scheduler:** karras
+* **Steps:** 30
+* **Denoise:** 1.0
 
-| Image | Configuration |
-|:-----:|:--------------|
-| [![Full checkpoint FP16](assets/sdxl_checkpoint-fp16.png)](assets/sdxl_checkpoint-fp16.png) | **Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Used as the reference output. |
-| [![GGUF FP16 + VAE from checkpoint](assets/sdxl_gguf-fp16_clip_vae.png)](assets/sdxl_gguf-fp16_clip_vae.png) | **GGUF FP16 UNet + CLIP and VAE extracted from the checkpoint**<br>The UNet is loaded in GGUF FP16 format. The VAE and CLIP are the originals extracted from the same checkpoint, also in FP16. Pixel-perfect identical to the full checkpoint output (mean difference: 0.0). |
-| [![GGUF FP16 + VAE fp16-fix FP16](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png)](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png) | **GGUF FP16 UNet + CLIP from checkpoint + madebyollin's VAE fp16-fix converted to FP16**<br>Same as above but using [madebyollin's sdxl-vae-fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) as the decoder. The original weights are FP32; they were converted to FP16 prior to this test. The conversion produced no overflow-to-inf cases and only 405 underflow-to-zero values out of millions of parameters — all negligible. Output is pixel-perfect identical to the reference (mean difference: 0.0). |
+| [![Full checkpoint FP16](assets/sdxl_checkpoint-fp16.png)](assets/sdxl_checkpoint-fp16.png) | [![GGUF FP16 + VAE from checkpoint](assets/sdxl_gguf-fp16_clip_vae.png)](assets/sdxl_gguf-fp16_clip_vae.png) | [![GGUF FP16 + VAE fp16-fix FP16](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png)](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png) |
+|:---:|:---:|:---:|
+| <small>**Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Reference output.</small> | <small>**GGUF FP16 + VAE extracted from checkpoint**<br>UNet in GGUF FP16, VAE and CLIP extracted from the same checkpoint in FP16. Pixel-perfect identical to the reference.</small> | <small>**GGUF FP16 + [madebyollin VAE fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) — FP16**<br>Same as above but with madebyollin's VAE (originally FP32, converted to FP16). No overflow; 405 negligible underflows. Pixel-perfect identical to the reference.</small> |
 
 ## [quantize-clip_g.py](doc/quantize-clip_g.md)
 
