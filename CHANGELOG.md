@@ -7,7 +7,39 @@ and this project uses a simple `major.minor` versioning scheme.
 
 ---
 
-## [2.6] - T5 precision flag consolidation
+## [1.1.0] - Initial release of quantize-clip_g.py
+
+### Added
+
+- **`quantize-clip_g.py`**: mixed FP16/FP8 (`float8_e4m3fn`) quantization for a CLIP-G text encoder extracted from an SDXL checkpoint in OpenCLIP format (`transformer.resblocks.N.*`). Output is compatible with ComfyUI-GGUF's `DualCLIPLoaderGGUF` node.
+
+- **Conservative quantization mode** (default): quantizes only `mlp.c_fc.weight` and `mlp.c_proj.weight` in intermediate blocks. All attention tensors, biases, LayerNorm parameters, embeddings, and projection tensors remain at FP16. First N blocks (`--first-blocks-keep`, default 7) and the last block (index 31) are always preserved at FP16.
+
+- **`--split-attn-qkv`**: splits the fused `attn.in_proj_weight` [Q;K;V] tensor into separate `attn.q_proj.weight`, `attn.k_proj.weight`, and `attn.v_proj.weight` tensors. Also splits `attn.in_proj_bias` into `attn.q_proj.bias`, `attn.k_proj.bias`, and `attn.v_proj.bias`. By default K and V are quantized to FP8; Q stays at FP16.
+
+- **`--keep-attn-kv-fp16`**: when splitting attention, keeps K and V at FP16. Useful for isolating the impact of the structural split vs K/V quantization. Requires `--split-attn-qkv`.
+
+- **`--attn-q-fp8`**: quantizes the Q projection to FP8 in intermediate blocks. Q is the most sensitive attention component. Requires `--split-attn-qkv`.
+
+- **`--attn-out-fp8`**: quantizes `attn.out_proj.weight` to FP8 in intermediate blocks. Works independently of `--split-attn-qkv` because `out_proj` is already a separate tensor in the original format.
+
+- **`--analyze` mode**: analyzes all weight tensors per block and prints quantization sensitivity metrics (Frobenius norm, max absolute value, std, outlier count and percentage relative to FP8 E4M3 range, and roundtrip NRMSE from FP16 → FP8 → FP16). Ranks blocks by weighted average quantization error, flags sensitive blocks (error > mean + 1 std), and emits a recommendation for `--first-blocks-keep`. The fused `in_proj_weight` is analyzed both as a whole and split into Q/K/V components.
+
+- **`--first-blocks-keep` / `-k`**: sets the number of initial blocks to preserve at FP16 (default: 7).
+
+- **`--dry-run`**: computes and prints the conversion summary without writing any file.
+
+- **`--verbose` / `-v`**: prints per-tensor dtype mapping and detailed outlier information.
+
+- **Tensor count verification**: after conversion, checks that the number of output tensors matches the expected count, accounting for the +4 net tensors per eligible block when `--split-attn-qkv` is active.
+
+- **NaN/Inf sanity check**: runs on all FP16 tensors before saving.
+
+- **Outlier warnings**: emitted for any tensor with values outside ±448 before FP8 quantization.
+
+---
+
+## [1.0.6] - T5 precision flag consolidation
 
 ### Changed
 
@@ -22,14 +54,14 @@ and this project uses a simple `major.minor` versioning scheme.
   extracted component carries that name (the component was renamed to `t5xxl` in
   v2.2). The flag is now functional.
 
-## [2.5] - Chroma distilled model support
+## [1.0.5] - Chroma distilled model support
 
 ### Fixed
 
 - Flux `transformer` component now recognises `distilled_guidance_layer.*` keys, present in Chroma distilled model variants. Without this pattern those keys were left unclassified and dropped from the extracted file.
 
 
-## [2.4] - Richer analyze mode output
+## [1.0.4] - Richer analyze mode output
 
 ### Changed
 
@@ -38,14 +70,14 @@ and this project uses a simple `major.minor` versioning scheme.
 - Sample key display increased from 3 to 10 keys per component.
 
 
-## [2.3] - Flux key transform fixes for nested transformer prefix
+## [1.0.3] - Flux key transform fixes for nested transformer prefix
 
 ### Fixed
 
 - Flux `clip_l` and `t5xxl` key transforms now also strip the intermediate `.transformer.` level present in some Flux checkpoint variants. Added transform entries for `text_encoders.clip_l.transformer.*`, `text_encoder.clip_l.transformer.*`, `clip_l.transformer.*`, and the equivalent patterns for `t5xxl`. Previously, keys from these checkpoints would pass through untransformed and fail to load as standalone models in ComfyUI.
 
 
-## [2.2] - Float8 support and Flux text encoder fixes
+## [1.0.2] - Float8 support and Flux text encoder fixes
 
 ### Added
 
@@ -64,7 +96,7 @@ and this project uses a simple `major.minor` versioning scheme.
 - `--t5xxl-precision` added to the component precision flag list in the CLI (alongside the existing `--t5-precision` for backward compatibility).
 
 
-## [2.1] - Adaptive 16-bit conversion and post-conversion validation
+## [1.0.1] - Adaptive 16-bit conversion and post-conversion validation
 
 ### Added
 
@@ -90,7 +122,7 @@ and this project uses a simple `major.minor` versioning scheme.
 - `fp8`/`fp5m2` entries from `DTYPE_BITS` (only standard float and int dtypes remain).
 
 
-## [2.0] - Universal extractor with architecture auto-detection
+## [1.0.0] - Universal extractor with architecture auto-detection
 
 Complete rewrite. The script is no longer SDXL/Pony-specific; it now detects the model architecture automatically and adapts its classification and key transformation logic accordingly.
 
@@ -128,7 +160,7 @@ Complete rewrite. The script is no longer SDXL/Pony-specific; it now detects the
 
 ---
 
-## [1.0] - Initial release
+## [0.1.0] - Initial release
 
 ### Added
 
