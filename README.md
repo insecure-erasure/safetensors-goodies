@@ -25,7 +25,7 @@ All three images were generated using the same prompt, seed, and sampler setting
 
 | [![Full checkpoint FP16](assets/sdxl_checkpoint-fp16.png)](assets/sdxl_checkpoint-fp16.png) | [![GGUF FP16 + VAE from checkpoint](assets/sdxl_gguf-fp16_clip_vae.png)](assets/sdxl_gguf-fp16_clip_vae.png) | [![GGUF FP16 + VAE fp16-fix FP16](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png)](assets/sdxl_gguf-fp16_clip_vae-fp16-fix-fp16.png) |
 |:---:|:---:|:---:|
-| <small>**Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Reference output.</small> | <small>**GGUF FP16 + VAE extracted from checkpoint**<br>UNet in GGUF FP16, VAE and CLIP extracted from the same checkpoint in FP16. Pixel-perfect identical to the reference.</small> | <small>**GGUF FP16 + [madebyollin VAE fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) — FP16**<br>Same as above but with madebyollin's VAE (originally FP32, converted to FP16). No overflow; 405 negligible underflows. Pixel-perfect identical to the reference.</small> |
+| <small>**Full checkpoint — FP16**<br>Standard SDXL checkpoint with the VAE baked in at FP16. Reference output.</small> | <small>**GGUF FP16 + VAE extracted from checkpoint**<br>UNet in GGUF FP16, VAE and CLIP extracted from the same checkpoint in FP16. Pixel-perfect identical to the reference.</small> | <small>**GGUF FP16 + [madebyollin VAE fp16-fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix) — FP16**<br>Same as above but with madebyollin's VAE (originally FP32, converted to FP16).</small> |
 
 ## [quantize-clip_g.py](doc/quantize-clip_g.md)
 
