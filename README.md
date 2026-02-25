@@ -82,7 +82,15 @@ Applies mixed FP16/FP8 quantization to a CLIP-G text encoder (OpenCLIP format). 
 
 The script includes an analysis mode (`--analyze`) that measures per-block quantization sensitivity and recommends which blocks to protect, making it easier to find a good precision/quality trade-off for a specific model.
 
-Quality comparisons against the full-precision baseline are planned.
+The following images were generated with SDXL using partially quantized CLIP-G text encoder. The encoder is quantized to FP8 (E4M3) in intermediate blocks only; the last block (31) and the first N (expressed by the parameter `-k`) blocks are always preserved at FP16. MLP weights (`mlp.c_fc`, `mlp.c_proj`) and the fused attention input projection (`attn.in_proj_weight`) are quantized by default. The table explores two variables:
+
+- Number of initial blocks preserved at FP16 (`-k 7`, `-k 3`, `-k 1`), from most conservative to most aggressive.
+- Whether the attention output projection (`attn.out_proj.weight`) is also quantized to FP8 via `--attn-out-fp8`.
+
+| | k=7 | k=3 | k=1 |
+|---|:---:|:---:|:---:|
+| in_proj FP8 | ![k7 qkv](assets/clip_g-k7-qkv_fp8.png) | ![k3 qkv](assets/clip_g-k3-qkv_fp8.png) | ![k1 qkv](assets/clip_g-k1-qkv_fp8.png) |
+| in_proj FP8<br>attn_out FP8 | ![k7 qkv+out](assets/clip_g-k7-qkv_fp8-out_fp8.png) | ![k3 qkv+out](assets/clip_g-k3-qkv_fp8-out_fp8.png) | ![k1 qkv+out](assets/clip_g-k1-qkv_fp8-out_fp8.png) |
 
 ## Requirements
 
