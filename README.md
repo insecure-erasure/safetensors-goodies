@@ -9,6 +9,16 @@ Extracts individual components (UNet/Transformer/DiT, VAE, text encoders) from a
 
 The main use case is preparing components for independent quantization. The typical workflow is to extract the components with this script, convert them to GGUF format using the conversion tools bundled with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), and then quantize them with `llama-quantize` from [llama.cpp](https://github.com/ggerganov/llama.cpp) using [city96's diffusion model patch](https://github.com/city96/ComfyUI-GGUF/blob/main/tools/README.md). This makes it possible to produce any K-quant variant (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, etc.) for any component of any supported architecture — something that checkpoint authors rarely provide beyond a handful of FP8 or INT4 releases.
 
+### CLIP Encoder Influence on Merged/Finetuned Checkpoints
+
+When working with merged or finetuned SDXL checkpoints, the CLIP encoders are not interchangeable. The UNet learns to condition on text embeddings from a specific CLIP weight distribution, so swapping them — even with a high-quality alternative — introduces a mismatch that affects the output.
+
+To prove this, the following table shows two images, the first one generated with checkpoint [Juggernaut XL Ragnarok](https://civitai.com/models/133005?modelVersionId=1759168) and the second one using CLIP models from [SDXL 1.0 base](https://civitai.com/models/101055?modelVersionId=128078). 
+
+| ![Juggernaut XL Ragnarok CLIPs](assets/clip-jug-rag-XL.png) |![SDXL 1.0 CLIPs](assets/clip-XL.png) |
+|:---:|:---:|
+| Juggernaut XL | SDXL 1.0 | 
+
 ### SDXL Pipeline Comparison: Checkpoint vs GGUF + VAE Configurations
 
 This section validates that different SDXL pipeline configurations produce equivalent results.
