@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.7] - Lumina/Z-Image AIO support
+
+### Added
+- DiT-only checkpoint detection: aborts extraction and informs the user that
+  the file can be used directly in ComfyUI.
+- LLM text encoder support (Qwen3, Gemma) for Lumina/Z-Image AIO checkpoints.
+
+### Fixed
+- Text encoder tensors in Z-Image Turbo AIO checkpoints were misclassified
+  into a spurious `transformer` bucket instead of `text_encoder`.
+- Lumina VAE extraction produced keys incompatible with the standalone VAE.
+
 ## [1.1.6] - Rename --first-blocks-keep to --keep-first-blocks; add --help to README
 
 ### Changed (`quantize-clip_g.py`)
