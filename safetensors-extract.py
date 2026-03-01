@@ -369,11 +369,37 @@ ARCHITECTURE_PATTERNS = {
             },
             'text_encoder': {
                 'patterns': [
+                    # Modern AIO checkpoints: text encoder packaged under a
+                    # named sub-namespace, e.g. text_encoders.qwen3_4b.*,
+                    # text_encoders.gemma.*, text_encoders.llama.*, etc.
+                    # This must come before the bare prefixes below so that
+                    # keys like text_encoders.qwen3_4b.transformer.model.layers.*
+                    # are captured here instead of falling through to the generic
+                    # classifier which would wrongly route them to 'transformer'.
+                    r'^text_encoders\.',
+                    r'^language_model\.',
+                    r'^gemma\.',
+                    # Legacy / flat packagings
                     r'^text_model\.',
                     r'^text_encoder\.',
                     r'^clip\.',
                 ],
-                'key_transforms': [],
+                'key_transforms': [
+                    # Strip the named sub-namespace wrapper so the output file
+                    # contains plain transformer keys (matching ComfyUI's
+                    # expectations for standalone text-encoder checkpoints).
+                    # The first matching transform wins, so order matters.
+                    ('text_encoders.qwen3_4b.transformer.', ''),
+                    ('text_encoders.qwen3_4b.', ''),
+                    ('text_encoders.gemma.transformer.', ''),
+                    ('text_encoders.gemma.', ''),
+                    ('text_encoders.llama.transformer.', ''),
+                    ('text_encoders.llama.', ''),
+                    # Generic fallback for any other named sub-namespace:
+                    # strip everything up to and including the second dot.
+                    # (Handled programmatically in transform_key via the
+                    # _lumina_strip_text_encoder_namespace helper below.)
+                ],
             },
             'vae': {
                 'patterns': [
@@ -384,6 +410,7 @@ ARCHITECTURE_PATTERNS = {
                 ],
                 'key_transforms': [
                     ('first_stage_model.', ''),
+                    ('vae.', ''),
                 ],
             },
         },
@@ -609,10 +636,22 @@ def transform_key(key, component, architecture):
     transformed = strip_wrapper_prefix(key)
 
     # Then apply component-specific transforms
+    matched = False
     for old_prefix, new_prefix in comp_info.get('key_transforms', []):
         if transformed.startswith(old_prefix):
             transformed = new_prefix + transformed[len(old_prefix):]
+            matched = True
             break
+
+    if not matched:
+        # Fallback for Lumina text_encoder: strip any text_encoders.<n>. namespace
+        # not covered by the explicit key_transforms list.
+        # E.g. text_encoders.some_new_model.transformer.model.layers.0.weight
+        #   -> transformer.model.layers.0.weight
+        if architecture == 'Lumina' and component == 'text_encoder':
+            m = re.match(r'^text_encoders\.[^.]+\.(.+)$', transformed)
+            if m:
+                transformed = m.group(1)
 
     return transformed
 
