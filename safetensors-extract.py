@@ -883,6 +883,41 @@ def analyze_checkpoint(input_path):
     return architecture, confidence, wrapper_prefix, components
 
 
+# Architectures where a DiT-only checkpoint is a normal/expected distribution format.
+# Maps architecture name → name of the single diffusion component bucket.
+SINGLE_DIFFUSION_ARCHITECTURES = {
+    'Flux': 'transformer',
+    'Lumina': 'dit',
+}
+
+
+def check_single_diffusion_component(architecture, component_tensors):
+    """
+    For architectures that are sometimes distributed as DiT-only checkpoints
+    (Flux/Chroma, Lumina/Z-Image), detect whether the loaded checkpoint contains
+    only the diffusion model and, if so, print a notice and signal the caller to
+    abort extraction.
+
+    Returns True if the caller should abort, False otherwise.
+    """
+    if architecture not in SINGLE_DIFFUSION_ARCHITECTURES:
+        return False
+
+    diffusion_bucket = SINGLE_DIFFUSION_ARCHITECTURES[architecture]
+    populated = [c for c, t in component_tensors.items() if t]
+
+    if populated != [diffusion_bucket]:
+        return False
+
+    print(f"\n{'=' * 70}")
+    print(f"ℹ  Single-component checkpoint detected ({architecture} / diffusion model only).")
+    print(f"   This checkpoint contains only the diffusion model and does not need")
+    print(f"   to be extracted. Use it directly in ComfyUI as-is.")
+    print(f"{'=' * 70}\n")
+
+    return True
+
+
 def extract_components(
     input_path,
     output_dir,
@@ -995,6 +1030,10 @@ def extract_components(
             print(f"    - {k}")
         if len(unknown_keys) > 5:
             print(f"    ... and {len(unknown_keys) - 5} more")
+
+    # --- Single-component shortcut (Flux / Lumina DiT-only checkpoints) ---
+    if check_single_diffusion_component(architecture, component_tensors):
+        return []
 
     # Determine what to extract
     if components_to_extract is None:
