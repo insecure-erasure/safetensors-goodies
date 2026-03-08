@@ -664,7 +664,7 @@ def apply_precision_policy(
     tensors,
     component_name,
     explicit_precision=None,
-    keep_precision=False,
+    downscale=False,
     mixed_dtype=False
 ):
     """
@@ -672,8 +672,8 @@ def apply_precision_policy(
 
     Policy:
     1. If explicit_precision is set (16 or 32): apply it
-    2. If keep_precision is True: keep original
-    3. Default: downscale fp32 to 16-bit (except VAE)
+    2. If downscale is True: downscale fp32 to 16-bit (except VAE)
+    3. Default: keep original precision
 
     For 16-bit conversion:
     - By default, analyze all tensors and pick fp16 or bf16 for the whole component
@@ -683,7 +683,7 @@ def apply_precision_policy(
         tensors: Dict of {key: tensor}
         component_name: Component name for logging
         explicit_precision: User-requested precision (16 or 32) or None
-        keep_precision: If True, preserve original precision
+        downscale: If True, downscale fp32 to 16-bit (VAE exempt unless overridden)
         mixed_dtype: If True, allow mixed fp16/bf16 per tensor
 
     Returns:
@@ -699,8 +699,8 @@ def apply_precision_policy(
     needs_16bit_conversion = False
     if explicit_precision == 16:
         needs_16bit_conversion = True
-    elif not keep_precision and not explicit_precision:
-        # Default policy: downscale fp32 to 16-bit, except VAE
+    elif downscale and not explicit_precision:
+        # Downscale policy: downscale fp32 to 16-bit, except VAE
         # Note: we no longer upscale float8 to fp16 (that would increase file size)
         if component_name != 'vae':
             # Check if any tensor is fp32/fp64 (higher than 16-bit)
@@ -745,7 +745,7 @@ def apply_precision_policy(
                 new_tensor = tensor
             precision_suffix = 'fp32'
 
-        elif explicit_precision == 16 or (needs_16bit_conversion and not keep_precision):
+        elif explicit_precision == 16 or (needs_16bit_conversion and downscale):
             # Convert to 16-bit (only downscale, never upscale)
             if is_float8_dtype(tensor.dtype):
                 # Float8: keep as is (no upsampling to fp16)
@@ -768,12 +768,8 @@ def apply_precision_policy(
 
             dtypes_used.add(new_tensor.dtype)
 
-        elif keep_precision:
-            # Keep original precision
-            new_tensor = tensor
-
         else:
-            # Default: keep as is (VAE or already low precision)
+            # Default: keep as is (no downscale, VAE, or already low precision)
             new_tensor = tensor
 
         converted[key] = new_tensor
@@ -962,7 +958,7 @@ def extract_components(
     output_dir,
     components_to_extract=None,
     precision_map=None,
-    keep_precision=False,
+    downscale=False,
     keep_original_keys=False,
     force_architecture=None,
     mixed_dtype=False
@@ -975,7 +971,7 @@ def extract_components(
         output_dir: Output directory
         components_to_extract: List of components to extract (None = all detected)
         precision_map: Dict mapping component names to explicit target precision (16 or 32)
-        keep_precision: If True, preserve original precision (unless overridden by precision_map)
+        downscale: If True, downscale fp32 to 16-bit adaptive (VAE exempt unless overridden)
         keep_original_keys: Don't transform keys
         force_architecture: Override auto-detection
         mixed_dtype: Allow mixed fp16/bf16 per tensor
@@ -1007,12 +1003,12 @@ def extract_components(
         print(f"Wrapper prefix: '{wrapper_prefix}'")
 
     # Show precision policy
-    if keep_precision:
-        print("Precision policy: keep original")
-    else:
+    if downscale:
         print("Precision policy: downscale fp32 → 16-bit adaptive (fp16 if fits, else bf16)")
         print("                  float8 kept as-is (no upsampling)")
         print("                  VAE keeps original precision")
+    else:
+        print("Precision policy: keep original (no downscale)")
 
     if mixed_dtype:
         print("Mixed dtype mode: enabled (per-tensor fp16/bf16 decision)")
@@ -1103,7 +1099,7 @@ def extract_components(
             tensors,
             comp,
             explicit_precision=explicit_precision,
-            keep_precision=keep_precision,
+            downscale=downscale,
             mixed_dtype=mixed_dtype
         )
 
@@ -1168,28 +1164,28 @@ Examples:
   # Analyze checkpoint structure
   %(prog)s -i model.safetensors --analyze
 
-  # Extract all components (fp32 auto-downscaled to 16-bit)
-  %(prog)s -i model.safetensors -d ./extracted
+  # Extract all components (original precision preserved)
+  %(prog)s -i model.safetensors -o ./extracted
 
-  # Extract keeping original precision
-  %(prog)s -i model.safetensors -d ./extracted -k
+  # Extract with fp32 downscaled to 16-bit
+  %(prog)s -i model.safetensors -o ./extracted --downscale
 
   # Extract only VAE and UNet
-  %(prog)s -i model.safetensors -d ./extracted -c vae -c unet
+  %(prog)s -i model.safetensors -o ./extracted -c vae -c unet
 
   # Force VAE to 16-bit precision
-  %(prog)s -i model.safetensors -d ./extracted --vae-precision 16
+  %(prog)s -i model.safetensors -o ./extracted --vae-precision 16
 
   # Allow mixed fp16/bf16 per tensor
-  %(prog)s -i model.safetensors -d ./extracted -m
+  %(prog)s -i model.safetensors -o ./extracted -m
 
   # List available components
   %(prog)s -i model.safetensors --list
 
 Precision policy:
-  - Default: fp32 tensors are downscaled to 16-bit (fp16 if values fit, bf16 otherwise)
-  - Exception: VAE always keeps original precision (for quality)
-  - With -k/--keep-precision: all tensors keep original precision
+  - Default: all tensors keep original precision
+  - With --downscale: fp32 tensors are downscaled to 16-bit (fp16 if values fit, bf16 otherwise)
+  - Exception: VAE always keeps original precision unless --vae-precision is used
   - Explicit --*-precision flags override the policy for that component
   - With -m/--mixed-dtype: per-tensor fp16/bf16 decision (may cause compatibility issues)
 
@@ -1199,7 +1195,7 @@ Unknown architectures are handled with generic pattern matching.
     )
 
     parser.add_argument('-i', '--input', required=True, help='Input .safetensors file')
-    parser.add_argument('-d', '--output-dir', help='Output directory for extracted components')
+    parser.add_argument('-o', '--output', help='Output directory for extracted components (required for extraction)')
 
     parser.add_argument(
         '-c', '--component',
@@ -1212,9 +1208,9 @@ Unknown architectures are handled with generic pattern matching.
     parser.add_argument('--list', action='store_true', help='List available components')
 
     parser.add_argument(
-        '-k', '--keep-precision',
+        '--downscale',
         action='store_true',
-        help='Keep original precision (default: downscale fp32 to 16-bit)'
+        help='Downscale fp32 tensors to 16-bit adaptive (default: keep original precision)'
     )
 
     parser.add_argument(
@@ -1272,8 +1268,8 @@ Unknown architectures are handled with generic pattern matching.
         return 0
 
     # Extract mode requires output dir
-    if not args.output_dir:
-        print("✗ Error: --output-dir required for extraction")
+    if not args.output:
+        print("✗ Error: -o/--output required for extraction")
         return 1
 
     # Build precision map from args
@@ -1291,10 +1287,10 @@ Unknown architectures are handled with generic pattern matching.
     try:
         extract_components(
             args.input,
-            args.output_dir,
+            args.output,
             components_to_extract=args.components,
             precision_map=precision_map,
-            keep_precision=args.keep_precision,
+            downscale=args.downscale,
             keep_original_keys=args.keep_original_keys,
             force_architecture=args.force_architecture,
             mixed_dtype=args.mixed_dtype

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.8] - Preserve precision by default, CLI cleanup
+
+### Changed
+- Default behavior now preserves original tensor precision. Downscaling fp32
+  to 16-bit requires the new `--downscale` flag.
+- `-d`/`--output-dir` renamed to `-o`/`--output`.
+- `-k`/`--keep-precision` removed (no longer needed).
+
+### Fixed
+- Documentation listed `fp32`, `fp16`, `bf16`, `fp8` as precision override
+  values; the CLI only accepts `16` or `32`.
+- Output naming section implied the precision suffix only appeared with
+  explicit overrides; it appears whenever any conversion occurs.
+- `--clip-precision` was documented for Flux (should be `--clip-l-precision`);
+  `--clip-l-precision` was missing Flux in its scope; `--t5-precision`
+  referenced Chroma as a separate architecture.
+
 ## [1.1.7] - Lumina/Z-Image AIO support
 
 ### Added

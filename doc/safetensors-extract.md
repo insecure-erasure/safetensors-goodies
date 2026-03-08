@@ -6,8 +6,8 @@ A command-line utility to extract individual components from diffusion model che
 
 - **Automatic architecture detection** — no need to specify the model type manually
 - Extracts components (UNet/Transformer/DiT, VAE, text encoders) with **ComfyUI-compatible key naming**
-- **Default precision policy**: fp32 tensors are downscaled to fp16 automatically; fp8/fp16/bf16 are kept as-is; VAE is always exempt
-- Per-component **precision overrides**: `fp32`, `fp16`, `bf16`, `fp8`
+- **Default precision policy**: fp32 tensors are downscaled to 16-bit adaptive (fp16 if values fit, else bf16); fp8/fp16/bf16 are kept as-is; VAE is always exempt
+- Per-component **precision overrides**: `16` (adaptive fp16/bf16) or `32` (keep fp32)
 - Analyze and list modes to inspect checkpoints without extracting anything
 - `--force-architecture` to override detection when needed
 
@@ -52,7 +52,7 @@ python safetensors-extract.py -i my_model.safetensors --list
 python safetensors-extract.py -i my_model.safetensors -d ./output
 ```
 
-fp32 tensors are automatically downscaled to fp16. VAE is kept at its original precision.
+fp32 tensors are automatically downscaled to 16-bit (fp16 if all values fit within ±65504, else bf16). VAE is kept at its original precision.
 
 ### Keep original precision
 
@@ -80,7 +80,7 @@ python safetensors-extract.py -i my_model.safetensors -d ./output \
     --vae-precision 16
 ```
 
-Precision flags accept `16` or `32`. For 16-bit targets, the script automatically chooses fp16 or bf16 based on value range analysis. Upscaling is never performed.
+Precision flags accept `16` or `32`. For 16-bit targets, the script automatically chooses fp16 or bf16 based on value range analysis. Upscaling is never performed. The script does not convert to fp8 — tensors already in float8 format are preserved as-is.
 
 ### Allow mixed fp16/bf16 per tensor
 
@@ -111,9 +111,11 @@ After every conversion, the script automatically checks for new infinities (over
 ## Output naming
 
 ```
-{model_name}_{component}.safetensors
-{model_name}_{component}.{precision}.safetensors   # when precision override is used
+{model_name}_{component}.safetensors                 # no conversion or original precision kept
+{model_name}_{component}.{precision}.safetensors      # when any precision conversion occurs
 ```
+
+The `{precision}` suffix (e.g. `fp16`, `bf16`, `fp8`, `fp8_mixed`) is added whenever the output contains converted tensors or tensors in a non-default precision, not only when an explicit precision override is used.
 
 ## Key transformation
 
@@ -173,12 +175,12 @@ If you need the original key names — for example to inspect the raw structure,
 | `--list` | Print detected architecture and component names |
 | `--keep-original-keys` | Preserve original key names (disables ComfyUI key transforms) |
 | `--vae-precision` | Precision override for VAE: `16` or `32` |
-| `--unet-precision` | Precision override for UNet |
-| `--transformer-precision` | Precision override for Transformer (Flux) |
-| `--dit-precision` | Precision override for DiT (Lumina, PixArt, HunyuanDiT) |
-| `--clip-precision` | Precision override for CLIP (SD15, Flux) |
-| `--clip-l-precision` | Precision override for CLIP-L (SDXL) |
-| `--clip-g-precision` | Precision override for CLIP-G (SDXL) |
-| `--t5-precision` | Precision override for T5-XXL encoder (Flux, Chroma) |
-| `--text-encoder-precision` | Precision override for text encoder (Lumina, PixArt, HunyuanDiT) |
-| `--text-encoder-2-precision` | Precision override for second text encoder (HunyuanDiT only) |
+| `--unet-precision` | Precision override for UNet: `16` or `32` |
+| `--transformer-precision` | Precision override for Transformer (Flux): `16` or `32` |
+| `--dit-precision` | Precision override for DiT (Lumina, PixArt, HunyuanDiT): `16` or `32` |
+| `--clip-precision` | Precision override for CLIP (SD 1.5/2.x): `16` or `32` |
+| `--clip-l-precision` | Precision override for CLIP-L (SDXL, Flux): `16` or `32` |
+| `--clip-g-precision` | Precision override for CLIP-G (SDXL): `16` or `32` |
+| `--t5-precision` | Precision override for T5-XXL encoder (Flux): `16` or `32` |
+| `--text-encoder-precision` | Precision override for text encoder (Lumina, PixArt, HunyuanDiT): `16` or `32` |
+| `--text-encoder-2-precision` | Precision override for second text encoder (HunyuanDiT only): `16` or `32` |
