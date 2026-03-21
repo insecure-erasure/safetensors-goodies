@@ -13,6 +13,7 @@ Key features:
 """
 
 import argparse
+import json
 import os
 import re
 import warnings
@@ -657,6 +658,107 @@ def transform_key(key, component, architecture):
 
 
 # =============================================================================
+# DTYPE SORTING AND FORMATTING
+# =============================================================================
+
+# Canonical dtype display names
+DTYPE_DISPLAY_NAMES = {
+    'float32':       'fp32',
+    'float16':       'fp16',
+    'bfloat16':      'bf16',
+    'float8_e4m3fn': 'fp8_e4m3fn',
+    'float8_e5m2':   'fp8_e5m2',
+    'int8':          'int8',
+    'uint8':         'uint8',
+    'int16':         'int16',
+    'int32':         'int32',
+    'int64':         'int64',
+}
+
+# Sort key: (-bits, type_order) where type_order: float=0, bfloat=1, int/uint=2
+DTYPE_SORT_KEY = {
+    'float32':       (32, 0),
+    'float16':       (16, 0),
+    'bfloat16':      (16, 1),
+    'float8_e4m3fn': (8,  0),
+    'float8_e5m2':   (8,  0),
+    'int8':          (8,  2),
+    'uint8':         (8,  2),
+    'int16':         (16, 2),
+    'int32':         (32, 2),
+    'int64':         (64, 2),
+}
+
+
+def sort_dtypes(dtype_counts):
+    """
+    Sort dtype names by (bits descending, float < bfloat < int).
+    Returns list of (dtype_name, count) sorted accordingly.
+    """
+    def sort_key(item):
+        dtype = item[0]
+        bits, type_order = DTYPE_SORT_KEY.get(dtype, (0, 3))
+        return (-bits, type_order)
+
+    return sorted(dtype_counts.items(), key=sort_key)
+
+
+def format_dtype_breakdown(dtype_counts, total):
+    """
+    Format dtype breakdown lines with aligned columns and percentages summing to 100%.
+    Returns list of formatted strings.
+    """
+    sorted_dtypes = sort_dtypes(dtype_counts)
+
+    # Build display labels and counts
+    rows = [(DTYPE_DISPLAY_NAMES.get(dtype, dtype), count) for dtype, count in sorted_dtypes]
+
+    if not rows:
+        return []
+
+    # Dynamic padding: align counts after the longest label
+    max_label_len = max(len(label) for label, _ in rows)
+    max_count_len = max(len(str(count)) for _, count in rows)
+
+    # Compute floored percentages, then distribute remainder to preserve 100% sum
+    raw_pcts = [count / total * 100 for _, count in rows]
+    floored = [int(p) for p in raw_pcts]
+    remainder = 100 - sum(floored)
+    fractions = sorted(
+        ((raw_pcts[i] - floored[i], i) for i in range(len(floored))),
+        reverse=True
+    )
+    for i in range(remainder):
+        floored[fractions[i][1]] += 1
+
+    lines = []
+    for i, (label, count) in enumerate(rows):
+        label_col = f"{label}:".ljust(max_label_len + 1)
+        count_col = str(count).rjust(max_count_len)
+        lines.append(f" - {label_col}  {count_col} ({floored[i]}%)")
+
+    return lines
+
+
+# =============================================================================
+# METADATA FORMATTING
+# =============================================================================
+
+def format_metadata_value(value):
+    """
+    Try to parse and pretty-print value as JSON with 2-space indent.
+    Falls back to plain text if not valid JSON.
+    Returns a list of lines.
+    """
+    try:
+        parsed = json.loads(value)
+        formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
+        return formatted.splitlines()
+    except (json.JSONDecodeError, TypeError):
+        return [str(value)]
+
+
+# =============================================================================
 # PRECISION CONVERSION
 # =============================================================================
 
@@ -846,15 +948,16 @@ def analyze_checkpoint(input_path):
         print(f"Wrapper prefix: '{wrapper_prefix}'")
     print("=" * 70)
 
-    # Show metadata first
+    # Metadata section
     if metadata:
-        print(f"\nMetadata ({len(metadata)} entries):")
-        for key, value in sorted(metadata.items()):
-            # Truncate very long values
-            value_str = str(value)
-            if len(value_str) > 200:
-                value_str = value_str[:197] + "..."
-            print(f"  {key}: {value_str}")
+        print(f"\nMetadata")
+        print("-" * 70)
+        for i, (key, value) in enumerate(sorted(metadata.items())):
+            if i > 0:
+                print()
+            print(f"{key}:")
+            for line in format_metadata_value(value):
+                print(line)
 
     # Classify all tensors and collect dtype information
     components = defaultdict(list)
@@ -875,45 +978,19 @@ def analyze_checkpoint(input_path):
 
             # Get dtype of this tensor
             tensor_meta = f.get_tensor(key)
-            dtype = tensor_meta.dtype
-
-            # Convert dtype to readable name
-            dtype_name = str(dtype).replace('torch.', '')
+            dtype_name = str(tensor_meta.dtype).replace('torch.', '')
             component_dtypes[comp][dtype_name] += 1
 
-    print("\nComponent breakdown:")
-    for comp, comp_keys in sorted(components.items()):
-        # Build dtype statistics string
-        dtype_counts = component_dtypes[comp]
-        dtype_parts = []
-        for dtype, count in sorted(dtype_counts.items()):
-            # Simplify dtype names
-            if dtype == 'float16':
-                dtype_parts.append(f"{count} fp16")
-            elif dtype == 'bfloat16':
-                dtype_parts.append(f"{count} bf16")
-            elif dtype == 'float32':
-                dtype_parts.append(f"{count} fp32")
-            elif dtype == 'float8_e4m3fn':
-                dtype_parts.append(f"{count} fp8_e4m3fn")
-            elif dtype == 'float8_e5m2':
-                dtype_parts.append(f"{count} fp8_e5m2")
-            else:
-                dtype_parts.append(f"{count} {dtype}")
-
-        dtype_str = ", ".join(dtype_parts)
-        print(f"\n  {comp}: {len(comp_keys)} tensors ({dtype_str})")
-
-        # Show sample keys
-        for k in comp_keys[:10]:
-            transformed = transform_key(k, comp, architecture)
-            if k != transformed:
-                print(f"    {k}")
-                print(f"      → {transformed}")
-            else:
-                print(f"    {k}")
-        if len(comp_keys) > 10:
-            print(f"    ... and {len(comp_keys) - 10} more")
+    # Component breakdown section
+    print(f"\nComponent breakdown")
+    print("-" * 70)
+    for i, (comp, comp_keys) in enumerate(sorted(components.items())):
+        if i > 0:
+            print()
+        total = len(comp_keys)
+        print(f"{comp} ({total} tensors)")
+        for line in format_dtype_breakdown(component_dtypes[comp], total):
+            print(line)
 
     return architecture, confidence, wrapper_prefix, components
 
@@ -1127,28 +1204,116 @@ def extract_components(
     return extracted_files
 
 
-def list_components(input_path):
+def _collect_component_data(input_path):
     """
-    List available components in a checkpoint.
+    Collect per-component data needed for listing: keys, dtypes, and wrapper prefix.
+    Returns (architecture, wrapper_prefix, components, component_dtypes, component_keys)
+    where:
+      - components: dict {comp: [original_keys]}
+      - component_dtypes: dict {comp: {dtype_name: count}}
+      - component_keys: dict {comp: [(transformed_key, dtype_name)]}
     """
     with safe_open(input_path, framework="pt", device="cpu") as f:
         keys = list(f.keys())
 
     architecture, confidence, wrapper_prefix = detect_architecture(keys)
 
-    components = set()
-    for key in keys:
-        if architecture != 'Unknown':
-            comp, _ = classify_tensor_by_architecture(key, architecture, wrapper_prefix)
+    components = defaultdict(list)
+    component_dtypes = defaultdict(lambda: defaultdict(int))
+    component_keys = defaultdict(list)
+
+    with safe_open(input_path, framework="pt", device="cpu") as f:
+        for key in keys:
+            if architecture != 'Unknown':
+                comp, _ = classify_tensor_by_architecture(key, architecture, wrapper_prefix)
+            else:
+                comp, _ = classify_tensor_generic(key, wrapper_prefix)
+
+            if comp is None:
+                comp, _ = classify_tensor_generic(key, wrapper_prefix)
+
+            comp = comp or 'unknown'
+            components[comp].append(key)
+
+            tensor_meta = f.get_tensor(key)
+            dtype_name = str(tensor_meta.dtype).replace('torch.', '')
+            component_dtypes[comp][dtype_name] += 1
+
+            transformed = transform_key(key, comp, architecture)
+            component_keys[comp].append((transformed, dtype_name))
+
+    return architecture, wrapper_prefix, components, component_dtypes, component_keys
+
+
+def _format_prefix_summary(wrapper_prefix, dtype_counts):
+    """
+    Format the prefix header line with dtype summary.
+    If all tensors share a single dtype, show it as [dtype].
+    If mixed, show [dtype: count, dtype: count, ...] ordered by sort_dtypes.
+    """
+    prefix_str = wrapper_prefix if wrapper_prefix else '(no prefix)'
+
+    if len(dtype_counts) == 1:
+        dtype = next(iter(dtype_counts))
+        label = DTYPE_DISPLAY_NAMES.get(dtype, dtype)
+        return f"  {prefix_str}  [{label}]"
+    else:
+        sorted_dtypes = sort_dtypes(dtype_counts)
+        parts = []
+        for dtype, count in sorted_dtypes:
+            label = DTYPE_DISPLAY_NAMES.get(dtype, dtype)
+            parts.append(f"{label}: {count}")
+        return f"  {prefix_str}  [{', '.join(parts)}]"
+
+
+def list_components(input_path):
+    """
+    List components with prefix and dtype composition summary, without tensor details.
+    """
+    architecture, wrapper_prefix, components, component_dtypes, _ = \
+        _collect_component_data(input_path)
+
+    print(f"Architecture: {architecture}")
+    print(f"Components")
+    print("-" * 70)
+    for i, comp in enumerate(sorted(components)):
+        if i > 0:
+            print()
+        total = len(components[comp])
+        print(f"{comp} ({total} tensors)")
+        print(_format_prefix_summary(wrapper_prefix, component_dtypes[comp]))
+
+
+def list_tensors(input_path):
+    """
+    List all tensors for each component, with dtype per tensor if mixed precision.
+    No truncation.
+    """
+    architecture, wrapper_prefix, components, component_dtypes, component_keys = \
+        _collect_component_data(input_path)
+
+    print(f"Architecture: {architecture}")
+    print(f"Components")
+    print("-" * 70)
+    for i, comp in enumerate(sorted(components)):
+        if i > 0:
+            print()
+        total = len(components[comp])
+        print(f"{comp} ({total} tensors)")
+
+        is_mixed = len(component_dtypes[comp]) > 1
+        prefix_line = _format_prefix_summary(wrapper_prefix, component_dtypes[comp])
+        print(prefix_line)
+
+        if is_mixed:
+            # Align dtype tags: find longest key name for padding
+            max_key_len = max(len(k) for k, _ in component_keys[comp])
+            for transformed, dtype_name in component_keys[comp]:
+                label = DTYPE_DISPLAY_NAMES.get(dtype_name, dtype_name)
+                print(f"    {transformed.ljust(max_key_len)}  [{label}]")
         else:
-            comp, _ = classify_tensor_generic(key, wrapper_prefix)
-
-        if comp is None:
-            comp, _ = classify_tensor_generic(key, wrapper_prefix)
-
-        components.add(comp or 'unknown')
-
-    return architecture, sorted(components)
+            for transformed, _ in component_keys[comp]:
+                print(f"    {transformed}")
 
 
 # =============================================================================
@@ -1179,8 +1344,11 @@ Examples:
   # Allow mixed fp16/bf16 per tensor
   %(prog)s -i model.safetensors -o ./extracted -m
 
-  # List available components
-  %(prog)s -i model.safetensors --list
+  # List components with dtype summary
+  %(prog)s -i model.safetensors --list-components
+
+  # List all tensors per component
+  %(prog)s -i model.safetensors --list-tensors
 
 Precision policy:
   - Default: all tensors keep original precision
@@ -1205,7 +1373,8 @@ Unknown architectures are handled with generic pattern matching.
     )
 
     parser.add_argument('--analyze', action='store_true', help='Analyze without extracting')
-    parser.add_argument('--list', action='store_true', help='List available components')
+    parser.add_argument('--list-components', action='store_true', help='List components with prefix and dtype summary')
+    parser.add_argument('--list-tensors', action='store_true', help='List all tensors per component (no truncation)')
 
     parser.add_argument(
         '--downscale',
@@ -1255,11 +1424,14 @@ Unknown architectures are handled with generic pattern matching.
         print(f"✗ Error: File must be .safetensors")
         return 1
 
-    # List mode
-    if args.list:
-        arch, components = list_components(args.input)
-        print(f"Architecture: {arch}")
-        print(f"Components: {', '.join(components)}")
+    # List components mode
+    if args.list_components:
+        list_components(args.input)
+        return 0
+
+    # List tensors mode
+    if args.list_tensors:
+        list_tensors(args.input)
         return 0
 
     # Analyze mode
