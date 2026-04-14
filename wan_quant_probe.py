@@ -913,11 +913,15 @@ def export_csv(
                                   FP8   if the group was *KEEP*->FP8 by spread,
                                   same as recommendation otherwise
       - reason: decision reason for the effective recommendation; one of:
-          kurtosis_floor      *KEEP* forced because excess kurtosis >= kurtosis_keep
-          score_percentile    *KEEP* or FP8 driven by percentile threshold
-          score_below_fp8_min NVFP4 because fp8_min_score guard blocked FP8
-          default             NVFP4 because score is below all thresholds
-          spread_demotion     FP8->NVFP4 or *KEEP*->FP8 by spread filter
+          kurtosis_floor       *KEEP* forced because excess kurtosis >= kurtosis_keep
+          score_percentile     *KEEP* or FP8 driven by percentile threshold
+          score_below_fp8_min  NVFP4 because fp8_min_score guard blocked FP8
+          default              NVFP4 because score is below all thresholds
+          group_keep_resolved  tensor was individually *KEEP* but demoted to FP8/NVFP4
+                               during per-tensor resolution within a *KEEP* group
+          group_fp8_promotion  tensor was individually NVFP4/FP8 but carried up to FP8
+                               because its block-position group scored FP8
+          spread_demotion      FP8->NVFP4 or *KEEP*->FP8 by spread filter
     """
     fieldnames = [
         "key", "layer_type", "block_idx",
@@ -1405,22 +1409,44 @@ Thresholds and extreme block ranges are derived automatically from the model.
         effective_rec: Dict[Tuple[str, int], str] = {}
         effective_reason: Dict[Tuple[str, int], str] = {}
 
+        # Build an individual reason index for fast lookup below
+        individual_reason: Dict[Tuple[str, int], str] = {
+            (m.layer_type, m.block_idx): m.reason for m in all_metrics
+        }
+
         for row in all_detail_rows:
             if row.spread_filtered:
+                # spread filter changed FP8→NVFP4 or *KEEP*→FP8 at group level
                 eff = "NVFP4" if row.recommendation == "FP8" else "FP8"
                 for idx in _block_range_to_indices(row.block_range):
                     effective_rec[(row.layer_type, idx)]    = eff
                     effective_reason[(row.layer_type, idx)] = "spread_demotion"
             elif row.recommendation == "*KEEP*":
-                # Resolve at individual tensor level, matching build_convert_to_quant_params
+                # Resolve at individual tensor level, matching build_convert_to_quant_params.
+                # Tensors that are individually *KEEP* keep their own reason.
+                # Tensors that are individually FP8/NVFP4 within a *KEEP* group are
+                # labelled group_keep_resolved: the group pulled them up to *KEEP* at
+                # aggregate level, but individual resolution brings them back down.
                 for idx in _block_range_to_indices(row.block_range):
                     ind_rec = individual_rec.get((row.layer_type, idx), row.recommendation)
                     effective_rec[(row.layer_type, idx)] = ind_rec
-                    # reason stays as the individual tensor's reason (already in m.reason)
+                    if ind_rec == "*KEEP*":
+                        # Genuinely kept: reason is the individual tensor's own reason
+                        pass  # effective_reason falls back to m.reason in export_csv
+                    else:
+                        # Demoted from group *KEEP* to individual FP8/NVFP4
+                        effective_reason[(row.layer_type, idx)] = "group_keep_resolved"
             else:
+                # Group recommendation is FP8 or NVFP4 (not spread-filtered).
+                # Tensors whose individual recommendation differs from the group's
+                # are being promoted: e.g. individually NVFP4 but carried up to FP8
+                # because their position group scored FP8. Label these group_fp8_promotion.
                 for idx in _block_range_to_indices(row.block_range):
                     effective_rec[(row.layer_type, idx)] = row.recommendation
-                    # reason stays as the individual tensor's reason
+                    ind_rec = individual_rec.get((row.layer_type, idx), row.recommendation)
+                    if ind_rec != row.recommendation:
+                        effective_reason[(row.layer_type, idx)] = "group_fp8_promotion"
+                    # else: reason stays as the individual tensor's reason
 
         export_csv(all_metrics, args.csv, effective_rec, effective_reason)
 
