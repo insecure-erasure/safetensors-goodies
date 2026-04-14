@@ -741,9 +741,10 @@ def _blocks_to_alternation(indices: List[int]) -> str:
 
 
 def build_convert_to_quant_params(
-    all_detail_rows:  List[AggregatedMetrics],
-    all_metrics:      List[TensorMetrics],
-    min_group_spread: float,
+    all_detail_rows:      List[AggregatedMetrics],
+    all_metrics:          List[TensorMetrics],
+    min_group_spread:     float,
+    spread_filter_exempt: set,
 ) -> Tuple[List[Tuple[str, List[int]]], List[Tuple[str, List[int]]]]:
     """
     Build FP8 and *KEEP* recommendations for convert_to_quant.
@@ -756,6 +757,11 @@ def build_convert_to_quant_params(
       - *KEEP* groups in low-spread types are demoted to FP8 (score still
         warrants conservative quantization, but not full BF16 retention).
 
+    Layer types listed in spread_filter_exempt are never subject to the
+    spread filter in either direction. Their per-tensor individual
+    recommendation is always used as-is, making the group position
+    irrelevant for those types.
+
     *KEEP* decisions are resolved at individual tensor level: when a group
     recommendation is *KEEP*, only the tensors that are individually *KEEP*
     are added to keep_entries. Tensors in the same group whose individual
@@ -766,18 +772,21 @@ def build_convert_to_quant_params(
     the *KEEP* threshold while its neighbours are unremarkable).
 
     Args:
-        all_detail_rows:  AggregatedMetrics rows from all detail tables,
-                          with recommendations already assigned
-        all_metrics:      per-tensor TensorMetrics with individual
-                          recommendations already assigned
-        min_group_spread: minimum score spread across position groups required
-                          to use per-group FP8 recommendations
+        all_detail_rows:      AggregatedMetrics rows from all detail tables,
+                              with recommendations already assigned
+        all_metrics:          per-tensor TensorMetrics with individual
+                              recommendations already assigned
+        min_group_spread:     minimum score spread across position groups required
+                              to use per-group FP8 recommendations
+        spread_filter_exempt: set of layer_type strings whose tensors always use
+                              their individual recommendation, bypassing the spread
+                              filter entirely in both directions
 
     Returns:
         Tuple of (fp8_entries, keep_entries), each a list of
         (layer_type, block_indices) tuples.
     """
-    # Index individual tensor recommendations for *KEEP* resolution
+    # Index individual tensor recommendations for *KEEP* resolution and exempt handling
     individual_rec: Dict[Tuple[str, int], str] = {
         (m.layer_type, m.block_idx): m.recommendation for m in all_metrics
     }
@@ -787,9 +796,11 @@ def build_convert_to_quant_params(
     for row in all_detail_rows:
         by_layer_type[row.layer_type].append(row)
 
-    # Identify layer types with insufficient spread
+    # Identify layer types with insufficient spread, excluding exempt types
     low_spread_types: set = set()
     for layer_type, rows in by_layer_type.items():
+        if layer_type in spread_filter_exempt:
+            continue
         scores = [r.score for r in rows]
         spread = max(scores) - min(scores)
         if spread < min_group_spread:
@@ -801,7 +812,24 @@ def build_convert_to_quant_params(
     for row in all_detail_rows:
         indices = _block_range_to_indices(row.block_range)
 
-        if row.layer_type in low_spread_types and row.recommendation == "FP8":
+        if row.layer_type in spread_filter_exempt:
+            # Exempt layer type: always use individual tensor recommendations,
+            # bypassing group-level spread filter in both directions.
+            keep_idxs = []
+            fp8_idxs  = []
+            for idx in indices:
+                rec = individual_rec.get((row.layer_type, idx), "NVFP4")
+                if rec == "*KEEP*":
+                    keep_idxs.append(idx)
+                elif rec == "FP8":
+                    fp8_idxs.append(idx)
+                # NVFP4 tensors need no entry
+            if keep_idxs:
+                keep_entries.append((row.layer_type, keep_idxs))
+            if fp8_idxs:
+                fp8_entries.append((row.layer_type, fp8_idxs))
+
+        elif row.layer_type in low_spread_types and row.recommendation == "FP8":
             row.spread_filtered = True
             # downgraded to NVFP4 — do not add to fp8_entries
 
@@ -1181,6 +1209,22 @@ Thresholds and extreme block ranges are derived automatically from the model.
         ),
     )
     parser.add_argument(
+        "--spread-filter-exempt",
+        nargs="*",
+        default=[],
+        metavar="LAYER_TYPE",
+        help=(
+            "Layer types that bypass the spread filter entirely, always using "
+            "their per-tensor individual recommendation regardless of group-level "
+            "score spread. Applies in both directions: neither FP8→NVFP4 demotion "
+            "nor NVFP4→FP8 promotion by group position will affect these types. "
+            "Recommended for layers that are numerically sensitive in DiT cross-attention, "
+            "where group averaging may mask individual tensor behaviour. "
+            "Example: --spread-filter-exempt cross_attn.k cross_attn.q "
+            "(default: none)"
+        ),
+    )
+    parser.add_argument(
         "--kurtosis-keep",
         type=float,
         default=8.0,
@@ -1221,6 +1265,14 @@ Thresholds and extreme block ranges are derived automatically from the model.
         print(f"Error: --kurtosis-weight + --range-weight + --ar-weight must sum to 1.0 (got {total_weight:.4f})")
         sys.exit(1)
 
+    # Validate spread_filter_exempt layer types
+    valid_layer_types = set(LAYER_PATTERNS.keys())
+    for lt in args.spread_filter_exempt:
+        if lt not in valid_layer_types:
+            print(f"Error: --spread-filter-exempt: unknown layer type '{lt}'. "
+                  f"Valid types: {', '.join(sorted(valid_layer_types))}")
+            sys.exit(1)
+
     # Resolve device
     if args.device:
         device = torch.device(args.device)
@@ -1238,11 +1290,13 @@ Thresholds and extreme block ranges are derived automatically from the model.
     print()
     print(f"  Quantization Sensitivity Analysis — {model_path.name}")
     print(f"  Device: {device_str}")
+    exempt_str = ", ".join(sorted(args.spread_filter_exempt)) if args.spread_filter_exempt else "none"
     print(f"  Outlier sigma: {args.outlier_sigma}  |  "
           f"FP8 percentile: {args.fp8_percentile}  |  "
           f"Keep percentile: {args.keep_percentile}  |  "
           f"FP8 min score: {args.fp8_min_score}  |  "
           f"Min group spread: {args.min_group_spread}  |  "
+          f"Spread filter exempt: {exempt_str}  |  "
           f"Extreme blocks: {args.extreme_pct}%  |  "
           f"Kurtosis keep: {args.kurtosis_keep}  |  "
           f"Low-RAM: {'yes' if args.lowram else 'no'}")
@@ -1381,7 +1435,8 @@ Thresholds and extreme block ranges are derived automatically from the model.
     # (must run before printing detail tables so spread_filtered flags are set)
     # ---------------------------------------------------------------------------
     fp8_entries, keep_entries = build_convert_to_quant_params(
-        all_detail_rows, all_metrics, args.min_group_spread
+        all_detail_rows, all_metrics, args.min_group_spread,
+        spread_filter_exempt=set(args.spread_filter_exempt),
     )
 
     # ---------------------------------------------------------------------------
@@ -1414,8 +1469,18 @@ Thresholds and extreme block ranges are derived automatically from the model.
             (m.layer_type, m.block_idx): m.reason for m in all_metrics
         }
 
+        spread_exempt = set(args.spread_filter_exempt)
+
         for row in all_detail_rows:
-            if row.spread_filtered:
+            if row.layer_type in spread_exempt:
+                # Exempt layer type: each tensor uses its individual recommendation
+                # and reason regardless of group position or spread.
+                for idx in _block_range_to_indices(row.block_range):
+                    ind_rec = individual_rec.get((row.layer_type, idx), "NVFP4")
+                    effective_rec[(row.layer_type, idx)] = ind_rec
+                    # reason stays as the individual tensor's reason
+
+            elif row.spread_filtered:
                 # spread filter changed FP8→NVFP4 or *KEEP*→FP8 at group level
                 eff = "NVFP4" if row.recommendation == "FP8" else "FP8"
                 for idx in _block_range_to_indices(row.block_range):
@@ -1460,8 +1525,14 @@ Thresholds and extreme block ranges are derived automatically from the model.
             (m.layer_type, m.block_idx): m.recommendation for m in all_metrics
         }
         effective_rec_sz: Dict[Tuple[str, int], str] = {}
+        spread_exempt_sz = set(args.spread_filter_exempt)
         for row in all_detail_rows:
-            if row.spread_filtered:
+            if row.layer_type in spread_exempt_sz:
+                for idx in _block_range_to_indices(row.block_range):
+                    effective_rec_sz[(row.layer_type, idx)] = individual_rec_sz.get(
+                        (row.layer_type, idx), "NVFP4"
+                    )
+            elif row.spread_filtered:
                 eff = "NVFP4" if row.recommendation == "FP8" else "FP8"
                 for idx in _block_range_to_indices(row.block_range):
                     effective_rec_sz[(row.layer_type, idx)] = eff
