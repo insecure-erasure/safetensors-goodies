@@ -945,11 +945,14 @@ def export_csv(
           score_percentile     *KEEP* or FP8 driven by percentile threshold
           score_below_fp8_min  NVFP4 because fp8_min_score guard blocked FP8
           default              NVFP4 because score is below all thresholds
-          group_keep_resolved  tensor was individually *KEEP* but demoted to FP8/NVFP4
-                               during per-tensor resolution within a *KEEP* group
-          group_fp8_promotion  tensor was individually NVFP4/FP8 but carried up to FP8
-                               because its block-position group scored FP8
-          spread_demotion      FP8->NVFP4 or *KEEP*->FP8 by spread filter
+          group_keep_resolved   tensor was individually *KEEP* but demoted to FP8/NVFP4
+                                during per-tensor resolution within a *KEEP* group
+          group_fp8_promotion   tensor was individually NVFP4 but carried up to FP8
+                                because its block-position group scored FP8
+          group_spread_demotion tensor was individually FP8 or *KEEP* but brought down
+                                by the group's spread-filter result (spread_filtered
+                                flag not set because the group rec is already NVFP4)
+          spread_demotion       FP8->NVFP4 or *KEEP*->FP8 by spread filter
     """
     fieldnames = [
         "key", "layer_type", "block_idx",
@@ -1503,15 +1506,22 @@ Thresholds and extreme block ranges are derived automatically from the model.
                         effective_reason[(row.layer_type, idx)] = "group_keep_resolved"
             else:
                 # Group recommendation is FP8 or NVFP4 (not spread-filtered).
-                # Tensors whose individual recommendation differs from the group's
-                # are being promoted: e.g. individually NVFP4 but carried up to FP8
-                # because their position group scored FP8. Label these group_fp8_promotion.
+                # Three sub-cases depending on direction:
+                #   group_fp8_promotion: individual was NVFP4/below-FP8, group carries it up to FP8
+                #   group_spread_demotion: individual was FP8 or *KEEP*, group brings it down
+                #                         (spread filter acted but spread_filtered flag not set,
+                #                          e.g. when the group rec itself is already NVFP4)
+                #   no change: individual and group agree
                 for idx in _block_range_to_indices(row.block_range):
                     effective_rec[(row.layer_type, idx)] = row.recommendation
                     ind_rec = individual_rec.get((row.layer_type, idx), row.recommendation)
-                    if ind_rec != row.recommendation:
+                    if ind_rec == row.recommendation:
+                        pass  # reason stays as the individual tensor's reason
+                    elif row.recommendation == "FP8" and ind_rec in ("NVFP4",):
                         effective_reason[(row.layer_type, idx)] = "group_fp8_promotion"
-                    # else: reason stays as the individual tensor's reason
+                    else:
+                        # Individual was FP8 or *KEEP* but group is lower: demotion by spread
+                        effective_reason[(row.layer_type, idx)] = "group_spread_demotion"
 
         export_csv(all_metrics, args.csv, effective_rec, effective_reason)
 
