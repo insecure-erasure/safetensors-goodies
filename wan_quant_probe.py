@@ -6,6 +6,11 @@ Analyzes weight tensors of transformer blocks to estimate sensitivity to
 quantization, helping decide which layers should be kept in BF16 (*KEEP*),
 quantized to FP8, or quantized to NVFP4.
 
+A hard floor on excess kurtosis (--kurtosis-keep, default 8.0) forces *KEEP*
+regardless of the percentile-based score when a tensor's distribution is
+extremely leptokurtic. This protects layers that the IQR clipping in norm_iqr()
+would otherwise under-penalise.
+
 Targets the following layer types across all transformer blocks:
   - cross_attn: k, v, q, o, k_img, v_img
   - self_attn:  k, v, q, o
@@ -140,6 +145,7 @@ class TensorMetrics:
     aspect_ratio: float        # max(rows, cols) / min(rows, cols)
     score: float = 0.0         # combined sensitivity score (filled after normalization)
     recommendation: str = ""   # *KEEP*, FP8, or NVFP4 (filled after thresholds)
+    reason: str = ""           # decision reason (filled alongside recommendation)
 
 
 @dataclass
@@ -156,6 +162,7 @@ class AggregatedMetrics:
     aspect_ratio: float
     score: float = 0.0
     recommendation: str = ""
+    reason: str = ""           # decision reason (mirrors TensorMetrics.reason for aggregates)
     spread_filtered: bool = False  # True when recommendation was changed by the spread filter
                                    # (FP8 → NVFP4, or *KEEP* → FP8)
 
@@ -310,31 +317,54 @@ def compute_auto_thresholds(
 
 
 def assign_recommendation(
-    score:          float,
-    fp8_threshold:  float,
-    keep_threshold: float,
-    fp8_min_score:  float = 0.0,
-) -> str:
+    score:           float,
+    fp8_threshold:   float,
+    keep_threshold:  float,
+    fp8_min_score:   float = 0.0,
+    excess_kurtosis: float = 0.0,
+    kurtosis_keep:   float = float('inf'),
+) -> Tuple[str, str]:
     """
-    Return *KEEP*, FP8, or NVFP4 based on score thresholds.
+    Return (*KEEP*|FP8|NVFP4, reason) based on score thresholds.
 
     FP8 requires both the percentile threshold and the absolute minimum score
     to be met. This prevents percentile-based thresholds from recommending FP8
     when all scores are clustered in a narrow range and no layer is genuinely
     sensitive.
 
+    A hard floor on excess kurtosis (kurtosis_keep) forces *KEEP* when a
+    tensor's distribution is extremely leptokurtic, regardless of its
+    percentile-based score. This protects layers that norm_iqr() under-penalises
+    because IQR clipping saturates the kurtosis contribution before the score
+    can reach the keep_threshold.
+
     Args:
-        score:          combined sensitivity score for the tensor or aggregate
-        fp8_threshold:  percentile-derived score threshold for FP8
-        keep_threshold: percentile-derived score threshold for *KEEP*
-        fp8_min_score:  absolute minimum score required for any FP8 recommendation
+        score:           combined sensitivity score for the tensor or aggregate
+        fp8_threshold:   percentile-derived score threshold for FP8
+        keep_threshold:  percentile-derived score threshold for *KEEP*
+        fp8_min_score:   absolute minimum score required for any FP8 recommendation
+        excess_kurtosis: raw excess kurtosis for the tensor or group mean/max
+        kurtosis_keep:   absolute excess kurtosis above which *KEEP* is forced
+                         regardless of score (default: inf, i.e. disabled)
+
+    Returns:
+        Tuple of (recommendation, reason) where reason is one of:
+          kurtosis_floor    — forced *KEEP* due to excess_kurtosis >= kurtosis_keep
+          score_percentile  — *KEEP* or FP8 driven by percentile threshold
+          score_below_fp8_min — NVFP4 because score >= fp8_threshold but
+                                 < fp8_min_score (fp8_min_score guard active)
+          default           — NVFP4 because score is below all thresholds
     """
+    if excess_kurtosis >= kurtosis_keep:
+        return "*KEEP*", "kurtosis_floor"
     if score >= keep_threshold:
-        return "*KEEP*"
+        return "*KEEP*", "score_percentile"
     elif score >= fp8_threshold and score >= fp8_min_score:
-        return "FP8"
+        return "FP8", "score_percentile"
+    elif score >= fp8_threshold and score < fp8_min_score:
+        return "NVFP4", "score_below_fp8_min"
     else:
-        return "NVFP4"
+        return "NVFP4", "default"
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +900,7 @@ def export_csv(
     all_metrics:      List[TensorMetrics],
     output_path:      str,
     effective_rec:    Dict[Tuple[str, int], str],
+    effective_reason: Dict[Tuple[str, int], str],
 ) -> None:
     """Export per-tensor metrics to a CSV file.
 
@@ -881,18 +912,27 @@ def export_csv(
       - effective_recommendation: NVFP4 if the group was FP8->NVFP4 by spread,
                                   FP8   if the group was *KEEP*->FP8 by spread,
                                   same as recommendation otherwise
+      - reason: decision reason for the effective recommendation; one of:
+          kurtosis_floor      *KEEP* forced because excess kurtosis >= kurtosis_keep
+          score_percentile    *KEEP* or FP8 driven by percentile threshold
+          score_below_fp8_min NVFP4 because fp8_min_score guard blocked FP8
+          default             NVFP4 because score is below all thresholds
+          spread_demotion     FP8->NVFP4 or *KEEP*->FP8 by spread filter
     """
     fieldnames = [
         "key", "layer_type", "block_idx",
         "rows", "cols",
         "excess_kurtosis", "dynamic_range", "std", "outlier_pct",
         "aspect_ratio", "score", "recommendation", "effective_recommendation",
+        "reason",
     ]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for m in all_metrics:
-            eff = effective_rec.get((m.layer_type, m.block_idx), m.recommendation)
+            key = (m.layer_type, m.block_idx)
+            eff = effective_rec.get(key, m.recommendation)
+            rsn = effective_reason.get(key, m.reason)
             writer.writerow({
                 "key":                      m.key,
                 "layer_type":               m.layer_type,
@@ -907,8 +947,114 @@ def export_csv(
                 "score":                    f"{m.score:.4f}",
                 "recommendation":           m.recommendation,
                 "effective_recommendation": eff,
+                "reason":                   rsn,
             })
     print(f"\n  CSV exported to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Output file size estimation
+# ---------------------------------------------------------------------------
+
+# Bytes per weight element for each effective format.
+# NVFP4: 4 bits data + 1 byte scale per group of 16 weights = 4.5 bits/weight
+#        = 0.5625 bytes/weight (assumes group size 16, standard for NVIDIA NVFP4).
+_BYTES_PER_WEIGHT: Dict[str, float] = {
+    "*KEEP*": 2.0,    # BF16
+    "FP8":    1.0,
+    "NVFP4":  0.5625,
+}
+
+
+def estimate_output_size(
+    all_metrics:      List[TensorMetrics],
+    effective_rec:    Dict[Tuple[str, int], str],
+    original_bytes:   int,
+) -> Dict:
+    """
+    Estimate the output file size if all recommendations are adopted.
+
+    The 480 tensors in scope are re-sized according to their effective
+    recommendation. The remaining tensors (out of scope) are assumed to
+    stay in BF16; their aggregate size is derived by subtracting the
+    in-scope BF16 footprint from the original file size.
+
+    Args:
+        all_metrics:    per-tensor TensorMetrics with shapes known
+        effective_rec:  (layer_type, block_idx) -> effective recommendation
+        original_bytes: original file size in bytes (from stat)
+
+    Returns:
+        Dict with keys:
+          in_scope_original_bytes   — in-scope tensors at BF16
+          in_scope_estimated_bytes  — in-scope tensors after quantization
+          per_format_bytes          — dict {format: estimated_bytes}
+          per_format_counts         — dict {format: tensor_count}
+          out_of_scope_bytes        — out-of-scope tensors (unchanged, BF16)
+          total_estimated_bytes     — full estimated output file size
+          original_bytes            — original file size (passed through)
+    """
+    in_scope_original = 0
+    in_scope_estimated = 0
+    per_format_bytes:  Dict[str, float] = {"*KEEP*": 0.0, "FP8": 0.0, "NVFP4": 0.0}
+    per_format_counts: Dict[str, int]   = {"*KEEP*": 0,   "FP8": 0,   "NVFP4": 0}
+
+    for m in all_metrics:
+        n_weights = m.shape[0] * m.shape[1]
+        in_scope_original += n_weights * 2  # BF16 = 2 bytes/weight
+
+        fmt = effective_rec.get((m.layer_type, m.block_idx), m.recommendation)
+        bpw = _BYTES_PER_WEIGHT.get(fmt, 2.0)
+        tensor_bytes = n_weights * bpw
+        in_scope_estimated          += tensor_bytes
+        per_format_bytes[fmt]        = per_format_bytes.get(fmt, 0.0) + tensor_bytes
+        per_format_counts[fmt]       = per_format_counts.get(fmt, 0)  + 1
+
+    out_of_scope = original_bytes - in_scope_original
+    total_estimated = out_of_scope + in_scope_estimated
+
+    return {
+        "in_scope_original_bytes":  in_scope_original,
+        "in_scope_estimated_bytes": in_scope_estimated,
+        "per_format_bytes":         per_format_bytes,
+        "per_format_counts":        per_format_counts,
+        "out_of_scope_bytes":       out_of_scope,
+        "total_estimated_bytes":    total_estimated,
+        "original_bytes":           original_bytes,
+    }
+
+
+def print_size_estimate(est: Dict) -> None:
+    """Print the estimated output file size block."""
+    def gb(b: float) -> str:
+        return f"{b / 1024**3:.2f} GB"
+
+    original  = est["original_bytes"]
+    total     = est["total_estimated_bytes"]
+    delta     = total - original
+    delta_pct = delta / original * 100.0
+    pfb       = est["per_format_bytes"]
+    pfc       = est["per_format_counts"]
+    n_scope   = sum(pfc.values())
+
+    sign      = "+" if delta >= 0 else "−"
+    abs_delta = abs(delta) / 1024**3
+
+    print()
+    print(SEP)
+    print("  ESTIMATED OUTPUT FILE SIZE")
+    print(SEP)
+    print(f"  Tensors in scope ({n_scope})  —  original BF16: {gb(est['in_scope_original_bytes'])}")
+    for fmt in ("*KEEP*", "FP8", "NVFP4"):
+        label = f"    {fmt} ({'BF16' if fmt == '*KEEP*' else fmt})"
+        print(f"  {label:<38}  {pfc[fmt]:>4} tensors  →  {gb(pfb[fmt]):>9}")
+    print(f"  {'  Subtotal after quantization':<38}  {gb(est['in_scope_estimated_bytes']):>9}")
+    print(f"  {'Tensors out of scope (BF16, unchanged)':<38}  {gb(est['out_of_scope_bytes']):>9}")
+    print(f"  {'─' * 60}")
+    print(f"  {'Total estimated':<38}  {gb(total):>9}")
+    print(f"  {'Original file size':<38}  {gb(original):>9}")
+    print(f"  {'Delta':<38}  {sign}{abs_delta:.2f} GB  ({sign}{abs(delta_pct):.1f}%)")
+    print(SEP)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1177,21 @@ Thresholds and extreme block ranges are derived automatically from the model.
         ),
     )
     parser.add_argument(
+        "--kurtosis-keep",
+        type=float,
+        default=8.0,
+        metavar="K",
+        help=(
+            "Hard floor on excess kurtosis: any layer (or group, using kurtosis_max) "
+            "with excess kurtosis >= K is forced to *KEEP* regardless of its "
+            "percentile-based score. Protects extremely leptokurtic tensors that "
+            "norm_iqr() clips before they can reach keep_threshold. "
+            "Default 8.0 captures the blocks.12 and blocks.20 cross_attn.o outliers "
+            "found in Wan 2.1 14B LightX2V distilled; set to inf to disable. "
+            "(default: 8.0)"
+        ),
+    )
+    parser.add_argument(
         "--lowram",
         action="store_true",
         default=False,
@@ -1079,6 +1240,7 @@ Thresholds and extreme block ranges are derived automatically from the model.
           f"FP8 min score: {args.fp8_min_score}  |  "
           f"Min group spread: {args.min_group_spread}  |  "
           f"Extreme blocks: {args.extreme_pct}%  |  "
+          f"Kurtosis keep: {args.kurtosis_keep}  |  "
           f"Low-RAM: {'yes' if args.lowram else 'no'}")
     print()
     print("  Scanning model...")
@@ -1143,8 +1305,10 @@ Thresholds and extreme block ranges are derived automatically from the model.
 
     # Assign recommendations
     for m in all_metrics:
-        m.recommendation = assign_recommendation(
-            m.score, fp8_threshold, keep_threshold, args.fp8_min_score
+        m.recommendation, m.reason = assign_recommendation(
+            m.score, fp8_threshold, keep_threshold, args.fp8_min_score,
+            excess_kurtosis=m.excess_kurtosis,
+            kurtosis_keep=args.kurtosis_keep,
         )
 
     # ---------------------------------------------------------------------------
@@ -1161,8 +1325,10 @@ Thresholds and extreme block ranges are derived automatically from the model.
             continue
         block_indices = [m.block_idx for m in group]
         agg = aggregate(group, layer_type, block_range_label(block_indices, total_blocks))
-        agg.recommendation = assign_recommendation(
-            agg.score, fp8_threshold, keep_threshold, args.fp8_min_score
+        agg.recommendation, agg.reason = assign_recommendation(
+            agg.score, fp8_threshold, keep_threshold, args.fp8_min_score,
+            excess_kurtosis=agg.kurtosis_max,
+            kurtosis_keep=args.kurtosis_keep,
         )
         summary_aggs.append(agg)
 
@@ -1195,8 +1361,10 @@ Thresholds and extreme block ranges are derived automatically from the model.
                 indices = [m.block_idx for m in subset]
                 label   = block_range_label(indices, total_blocks)
                 agg     = aggregate(subset, layer_type, label)
-                agg.recommendation = assign_recommendation(
-                    agg.score, fp8_threshold, keep_threshold, args.fp8_min_score
+                agg.recommendation, agg.reason = assign_recommendation(
+                    agg.score, fp8_threshold, keep_threshold, args.fp8_min_score,
+                    excess_kurtosis=agg.kurtosis_max,
+                    kurtosis_keep=args.kurtosis_keep,
                 )
                 group_rows.append(agg)
 
@@ -1235,21 +1403,56 @@ Thresholds and extreme block ranges are derived automatically from the model.
             (m.layer_type, m.block_idx): m.recommendation for m in all_metrics
         }
         effective_rec: Dict[Tuple[str, int], str] = {}
+        effective_reason: Dict[Tuple[str, int], str] = {}
+
         for row in all_detail_rows:
             if row.spread_filtered:
                 eff = "NVFP4" if row.recommendation == "FP8" else "FP8"
                 for idx in _block_range_to_indices(row.block_range):
-                    effective_rec[(row.layer_type, idx)] = eff
+                    effective_rec[(row.layer_type, idx)]    = eff
+                    effective_reason[(row.layer_type, idx)] = "spread_demotion"
             elif row.recommendation == "*KEEP*":
                 # Resolve at individual tensor level, matching build_convert_to_quant_params
                 for idx in _block_range_to_indices(row.block_range):
-                    effective_rec[(row.layer_type, idx)] = individual_rec.get(
+                    ind_rec = individual_rec.get((row.layer_type, idx), row.recommendation)
+                    effective_rec[(row.layer_type, idx)] = ind_rec
+                    # reason stays as the individual tensor's reason (already in m.reason)
+            else:
+                for idx in _block_range_to_indices(row.block_range):
+                    effective_rec[(row.layer_type, idx)] = row.recommendation
+                    # reason stays as the individual tensor's reason
+
+        export_csv(all_metrics, args.csv, effective_rec, effective_reason)
+
+    # ---------------------------------------------------------------------------
+    # Estimated output file size
+    # ---------------------------------------------------------------------------
+    # Build effective_rec for size estimation regardless of --csv flag.
+    # Reuse the dict built above if CSV was requested; otherwise build it now.
+    if not args.csv:
+        individual_rec_sz: Dict[Tuple[str, int], str] = {
+            (m.layer_type, m.block_idx): m.recommendation for m in all_metrics
+        }
+        effective_rec_sz: Dict[Tuple[str, int], str] = {}
+        for row in all_detail_rows:
+            if row.spread_filtered:
+                eff = "NVFP4" if row.recommendation == "FP8" else "FP8"
+                for idx in _block_range_to_indices(row.block_range):
+                    effective_rec_sz[(row.layer_type, idx)] = eff
+            elif row.recommendation == "*KEEP*":
+                for idx in _block_range_to_indices(row.block_range):
+                    effective_rec_sz[(row.layer_type, idx)] = individual_rec_sz.get(
                         (row.layer_type, idx), row.recommendation
                     )
             else:
                 for idx in _block_range_to_indices(row.block_range):
-                    effective_rec[(row.layer_type, idx)] = row.recommendation
-        export_csv(all_metrics, args.csv, effective_rec)
+                    effective_rec_sz[(row.layer_type, idx)] = row.recommendation
+    else:
+        effective_rec_sz = effective_rec  # already built above
+
+    original_bytes = model_path.stat().st_size
+    size_est = estimate_output_size(all_metrics, effective_rec_sz, original_bytes)
+    print_size_estimate(size_est)
 
 
 if __name__ == "__main__":
