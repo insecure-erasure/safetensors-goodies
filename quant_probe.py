@@ -99,7 +99,7 @@ _WAN_DEFAULT_ARGS = {
 _ZIMAGE_DEFAULT_ARGS = {
     "fp8_percentile":   75.0,
     "keep_percentile":  90.0,
-    "kurtosis_keep":    8.0,
+    "kurtosis_keep":     8.0,
     "fp8_min_score":    0.0,
     "min_group_spread": 0.20,
 }
@@ -184,6 +184,10 @@ MODEL_CONFIGS = {
         "refiner_detail_groups": None,
         "default_args":       _WAN_DEFAULT_ARGS,
         "highprec_excluded":  None,
+        # Attention Q/K projections: primary source of quantization error in DiT
+        # (QK^T operation amplifies leptokurtic distributions).
+        "spread_filter_recommended": ["cross_attn.k", "cross_attn.q",
+                                      "self_attn.k",  "self_attn.q"],
     },
     "zimage": {
         "description":        "Z-Image / Z-Image Turbo image diffusion model",
@@ -194,6 +198,10 @@ MODEL_CONFIGS = {
         "refiner_detail_groups": _ZIMAGE_REFINER_DETAIL_GROUPS,
         "default_args":       _ZIMAGE_DEFAULT_ARGS,
         "highprec_excluded":  ZIMAGE_HIGHPREC_EXCLUDED,
+        # Q/K/V are fused into a single tensor (attention.qkv); attention.out
+        # projects attended values back to the residual stream — both are
+        # sensitive to quantization error in DiT architectures.
+        "spread_filter_recommended": ["attention.qkv", "attention.out"],
     },
 }
 
@@ -1113,7 +1121,16 @@ Default thresholds are calibrated per model:
                         help="Minimum score spread across block position groups for per-group FP8 (default: model-specific).")
     parser.add_argument("--spread-filter-exempt", nargs="*", default=[],
                         metavar="LAYER_TYPE",
-                        help="Layer types that bypass the spread filter.")
+                        help=(
+                            "Layer types that bypass the spread filter, always using "
+                            "their per-tensor individual recommendation. "
+                            "Strongly recommended for attention Q/K layers due to DiT "
+                            "QK^T sensitivity: quantization error in Q/K projections is "
+                            "amplified by the attention operation and degrades output quality. "
+                            "Recommended values — "
+                            "wan: cross_attn.k cross_attn.q self_attn.k self_attn.q  |  "
+                            "zimage: attention.qkv attention.out"
+                        ))
     parser.add_argument("--kurtosis-keep", type=float, default=None, metavar="K",
                         help="Hard floor on excess kurtosis: forces *KEEP* (default: model-specific).")
     parser.add_argument("--lowram", action="store_true", default=False,
@@ -1164,6 +1181,20 @@ Default thresholds are calibrated per model:
             print(f"Error: --spread-filter-exempt: unknown layer type '{lt}' for model '{args.model}'.")
             print(f"       Valid types: {', '.join(sorted(all_layer_types))}")
             sys.exit(1)
+
+    # Warn if recommended attention layers are not in spread_filter_exempt
+    spread_recommended = cfg.get("spread_filter_recommended", [])
+    exempt_set = set(args.spread_filter_exempt)
+    missing = [lt for lt in spread_recommended if lt not in exempt_set]
+    if missing:
+        print()
+        print(f"  *** WARNING: the following attention layer types are NOT in")
+        print(f"  *** --spread-filter-exempt and may produce suboptimal recommendations")
+        print(f"  *** due to DiT QK^T sensitivity (group-level averaging can mask")
+        print(f"  *** individual tensor behavior in attention projections):")
+        print(f"  ***   {' '.join(missing)}")
+        print(f"  *** Consider re-running with:")
+        print(f"  ***   --spread-filter-exempt {' '.join(spread_recommended)}")
 
     # Resolve device
     if args.device:
