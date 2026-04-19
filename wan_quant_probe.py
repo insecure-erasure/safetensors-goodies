@@ -99,9 +99,9 @@ _WAN_DEFAULT_ARGS = {
 _ZIMAGE_DEFAULT_ARGS = {
     "fp8_percentile":   75.0,
     "keep_percentile":  90.0,
-    "kurtosis_keep":     8.0,
-    "fp8_min_score":    0.50,
-    "min_group_spread": 0.30,
+    "kurtosis_keep":    8.0,
+    "fp8_min_score":    0.0,
+    "min_group_spread": 0.20,
 }
 
 # Regex patterns for Wan 2.1 — keyed by display group name.
