@@ -97,11 +97,11 @@ _WAN_DEFAULT_ARGS = {
 }
 
 _ZIMAGE_DEFAULT_ARGS = {
-    "fp8_percentile":  None,
-    "keep_percentile": None,
-    "kurtosis_keep":   None,
-    "fp8_min_score":   None,
-    "min_group_spread": None,
+    "fp8_percentile":   75.0,
+    "keep_percentile":  90.0,
+    "kurtosis_keep":     8.0,
+    "fp8_min_score":    0.50,
+    "min_group_spread": 0.30,
 }
 
 # Regex patterns for Wan 2.1 — keyed by display group name.
@@ -1079,10 +1079,9 @@ Score composition:
 
 Thresholds and extreme block ranges are derived automatically from the model.
 
-NOTE: Default thresholds (--fp8-percentile, --keep-percentile, etc.) are
-calibrated for Wan 2.1. For Z-Image, Wan defaults are used as a starting
-point until empirical calibration is performed. Run with --csv and inspect
-the score distribution before relying on the output for Z-Image models.
+Default thresholds are calibrated per model:
+  wan    - calibrated from Wan 2.1 14B score distribution
+  zimage - calibrated empirically from Z-Image Turbo score distribution
 """,
     )
     parser.add_argument("model_path", type=str,
@@ -1150,13 +1149,11 @@ the score distribution before relying on the output for Z-Image models.
         wan_val = _WAN_DEFAULT_ARGS[key]
         return wan_val, True
 
-    fp8_percentile,   fb1 = resolve(args.fp8_percentile,   "fp8_percentile")
-    keep_percentile,  fb2 = resolve(args.keep_percentile,  "keep_percentile")
-    kurtosis_keep,    fb3 = resolve(args.kurtosis_keep,     "kurtosis_keep")
-    fp8_min_score,    fb4 = resolve(args.fp8_min_score,     "fp8_min_score")
-    min_group_spread, fb5 = resolve(args.min_group_spread,  "min_group_spread")
-
-    uncalibrated = any([fb1, fb2, fb3, fb4, fb5])
+    fp8_percentile,   _ = resolve(args.fp8_percentile,   "fp8_percentile")
+    keep_percentile,  _ = resolve(args.keep_percentile,  "keep_percentile")
+    kurtosis_keep,    _ = resolve(args.kurtosis_keep,     "kurtosis_keep")
+    fp8_min_score,    _ = resolve(args.fp8_min_score,     "fp8_min_score")
+    min_group_spread, _ = resolve(args.min_group_spread,  "min_group_spread")
 
     # Validate spread_filter_exempt layer types
     all_layer_types = set(cfg["layer_patterns"].keys())
@@ -1185,12 +1182,6 @@ the score distribution before relying on the output for Z-Image models.
     print(f"  Quantization Sensitivity Analysis — {model_path.name}")
     print(f"  Model: {args.model}  ({cfg['description']})")
     print(f"  Device: {device_str}")
-
-    if uncalibrated:
-        print()
-        print("  *** WARNING: default thresholds not yet calibrated for this model.")
-        print("  *** Wan 2.1 values are used as fallback. Run with --csv and inspect")
-        print("  *** the score distribution before relying on these results.")
 
     exempt_str = ", ".join(sorted(args.spread_filter_exempt)) if args.spread_filter_exempt else "none"
     print(f"  Outlier sigma: {args.outlier_sigma}  |  "
