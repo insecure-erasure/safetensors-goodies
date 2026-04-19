@@ -813,7 +813,7 @@ def build_convert_to_quant_params(
         elif row.recommendation == "*KEEP*":
             keep_idxs, fp8_idxs = [], []
             for idx in indices:
-                rec = individual_rec.get((row.layer_type, idx, subgraph), row.recommendation)
+                rec = individual_rec.get((row.layer_type, idx, subgraph), "NVFP4")
                 if rec == "*KEEP*":
                     keep_idxs.append(idx)
                 elif rec == "FP8":
@@ -1386,7 +1386,7 @@ Default thresholds are calibrated per model:
                         continue
                     indices = [m.block_idx for m in subset]
                     label   = block_range_label(indices, total_blocks)
-                    agg     = aggregate(subset, layer_type, label, "layers")
+                    agg     = aggregate(subset, layer_type, label, subset[0].subgraph)
                     agg.recommendation, agg.reason = assign_recommendation(
                         agg.score, fp8_threshold, keep_threshold, fp8_min_score,
                         excess_kurtosis=agg.kurtosis_max,
